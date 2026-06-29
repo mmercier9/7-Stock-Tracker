@@ -1,4 +1,3 @@
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -6,6 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
@@ -77,11 +77,13 @@ def validate_portfolio(portfolio):
     return True, ""
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def download_intraday_data(symbols_tuple):
     """
     Downloads 1-minute intraday close prices from yfinance.
-    Cached briefly to avoid excessive repeated calls during refreshes.
+
+    The cache TTL is intentionally short so auto-refresh can request
+    updated data without repeatedly hammering the data source.
     """
 
     symbols = list(symbols_tuple)
@@ -245,7 +247,7 @@ def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
     return fig
 
 
-def make_summary_table(portfolio, pct_change, weighted_portfolio_change):
+def make_summary_table(portfolio, pct_change):
     rows = []
     total_weight = sum(portfolio.values())
 
@@ -276,6 +278,24 @@ def make_summary_table(portfolio, pct_change, weighted_portfolio_change):
     summary_df = pd.DataFrame(rows)
 
     return summary_df
+
+
+def format_summary_for_display(summary_df):
+    display_df = summary_df.copy()
+
+    numeric_columns = [
+        "Entered Weight %",
+        "Normalized Weight %",
+        "Latest % Change",
+        "Weighted Contribution",
+    ]
+
+    for column in numeric_columns:
+        display_df[column] = display_df[column].map(
+            lambda x: "" if pd.isna(x) else f"{x:.2f}"
+        )
+
+    return display_df
 
 
 # ============================================================
@@ -332,13 +352,28 @@ refresh_seconds = st.sidebar.number_input(
     step=15,
 )
 
-auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False)
+auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
 
 manual_refresh = st.sidebar.button("Refresh now")
 
 st.sidebar.caption(
     "Note: MDA may need to be entered as MDA.TO for Yahoo Finance."
 )
+
+# ============================================================
+# AUTO-REFRESH CONTROL
+# ============================================================
+
+if auto_refresh:
+    refresh_count = st_autorefresh(
+        interval=int(refresh_seconds * 1000),
+        key="portfolio_auto_refresh",
+    )
+else:
+    refresh_count = 0
+
+if manual_refresh:
+    st.cache_data.clear()
 
 
 # ============================================================
@@ -350,9 +385,6 @@ if not is_valid:
     st.stop()
 
 symbols = tuple(portfolio_weights.keys())
-
-if manual_refresh:
-    st.cache_data.clear()
 
 with st.spinner("Downloading intraday market data..."):
     closes, messages = download_intraday_data(symbols)
@@ -382,8 +414,11 @@ if weighted_portfolio_change.empty:
 else:
     latest_portfolio_change = weighted_portfolio_change.dropna().iloc[-1]
 
-# Top metrics
-col1, col2, col3 = st.columns(3)
+# ============================================================
+# TOP METRICS
+# ============================================================
+
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
@@ -403,6 +438,22 @@ with col3:
         datetime.now(EASTERN_TZ).strftime("%I:%M:%S %p ET"),
     )
 
+with col4:
+    if auto_refresh:
+        st.metric(
+            "Refresh count",
+            refresh_count,
+        )
+    else:
+        st.metric(
+            "Auto-refresh",
+            "Off",
+        )
+
+# ============================================================
+# CHART
+# ============================================================
+
 fig = make_chart(
     pct_change=pct_change,
     weighted_portfolio_change=weighted_portfolio_change,
@@ -411,25 +462,18 @@ fig = make_chart(
 
 st.plotly_chart(fig, use_container_width=True)
 
+# ============================================================
+# SUMMARY TABLE
+# ============================================================
+
 summary_df = make_summary_table(
     portfolio=portfolio_weights,
     pct_change=pct_change,
-    weighted_portfolio_change=weighted_portfolio_change,
 )
 
 st.subheader("Portfolio Summary")
 
-display_df = summary_df.copy()
-
-for column in [
-    "Entered Weight %",
-    "Normalized Weight %",
-    "Latest % Change",
-    "Weighted Contribution",
-]:
-    display_df[column] = display_df[column].map(
-        lambda x: "" if pd.isna(x) else f"{x:.2f}"
-    )
+display_df = format_summary_for_display(summary_df)
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -442,9 +486,11 @@ st.download_button(
     mime="text/csv",
 )
 
+# ============================================================
+# STATUS MESSAGE
+# ============================================================
+
 if auto_refresh:
     st.caption(f"Auto-refresh is on. Refreshing every {refresh_seconds} seconds.")
-    time.sleep(refresh_seconds)
-    st.rerun()
 else:
     st.caption("Auto-refresh is off. Use Refresh now to update the chart.")
