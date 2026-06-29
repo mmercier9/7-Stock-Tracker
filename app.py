@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -24,6 +24,10 @@ DEFAULT_PORTFOLIO = [
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 
+# Regular US market hours in Eastern Time
+MARKET_OPEN_TIME = dt_time(9, 30)
+MARKET_CLOSE_TIME = dt_time(16, 0)
+
 
 # ============================================================
 # PAGE SETUP
@@ -37,7 +41,7 @@ st.set_page_config(
 
 st.title("Weighted Stock Portfolio Tracker")
 st.caption(
-    "Intraday tracker using individual stock percent changes and a weighted portfolio fund line."
+    "Intraday tracker using regular market hours only: 9:30 AM to 4:00 PM Eastern Time."
 )
 
 
@@ -77,13 +81,33 @@ def validate_portfolio(portfolio):
     return True, ""
 
 
+def filter_regular_market_hours(data):
+    """
+    Keeps only regular market hours:
+    9:30 AM ET through 4:00 PM ET.
+
+    This makes the chart restart at market open each trading day.
+    """
+
+    if data.empty:
+        return data
+
+    data = data.sort_index()
+
+    return data.between_time(
+        MARKET_OPEN_TIME,
+        MARKET_CLOSE_TIME,
+        inclusive="both"
+    )
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def download_intraday_data(symbols_tuple):
     """
     Downloads 1-minute intraday close prices from yfinance.
 
-    The cache TTL is intentionally short so auto-refresh can request
-    updated data without repeatedly hammering the data source.
+    Timestamps are converted to Eastern Time and filtered to regular
+    market hours only.
     """
 
     symbols = list(symbols_tuple)
@@ -99,6 +123,7 @@ def download_intraday_data(symbols_tuple):
                 auto_adjust=False,
                 progress=False,
                 threads=False,
+                prepost=False,
             )
 
             if data.empty:
@@ -110,6 +135,13 @@ def download_intraday_data(symbols_tuple):
                 data.index = data.index.tz_localize("UTC").tz_convert(EASTERN_TZ)
             else:
                 data.index = data.index.tz_convert(EASTERN_TZ)
+
+            # Keep only 9:30 AM to 4:00 PM Eastern.
+            data = filter_regular_market_hours(data)
+
+            if data.empty:
+                messages.append(f"{symbol}: no regular-hours intraday data available yet.")
+                continue
 
             # Handle either normal or MultiIndex columns.
             if isinstance(data.columns, pd.MultiIndex):
@@ -137,7 +169,10 @@ def download_intraday_data(symbols_tuple):
 
 def calculate_percent_change(closes):
     """
-    Calculates percent change from first valid intraday price.
+    Calculates percent change from first valid regular-market intraday price.
+
+    Because the data has already been filtered to start at 9:30 AM ET,
+    this resets the baseline at market open each trading day.
     """
 
     pct_change = pd.DataFrame(index=closes.index)
@@ -190,6 +225,39 @@ def calculate_weighted_portfolio_change(pct_change, portfolio_weights):
     return weighted_change
 
 
+def get_chart_day(index):
+    """
+    Returns the trading date used for the chart x-axis range.
+    """
+
+    if index.empty:
+        return datetime.now(EASTERN_TZ).date()
+
+    return index.max().date()
+
+
+def get_market_open_close_for_chart(index):
+    """
+    Builds 9:30 AM and 4:00 PM Eastern datetime values for the chart date.
+    """
+
+    chart_day = get_chart_day(index)
+
+    market_open = datetime.combine(
+        chart_day,
+        MARKET_OPEN_TIME,
+        tzinfo=EASTERN_TZ
+    )
+
+    market_close = datetime.combine(
+        chart_day,
+        MARKET_CLOSE_TIME,
+        tzinfo=EASTERN_TZ
+    )
+
+    return market_open, market_close
+
+
 def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
     fig = go.Figure()
 
@@ -221,15 +289,17 @@ def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
     fig.add_hline(y=0, line_width=1)
 
     eastern_now = datetime.now(EASTERN_TZ)
+    market_open, market_close = get_market_open_close_for_chart(pct_change.index)
 
     fig.update_layout(
         title=(
             "Intraday Performance — Individual Stocks + Weighted Portfolio Fund"
-            f"<br><sup>Weighted Portfolio Change: {latest_portfolio_change:+.2f}% | "
+            f"<br><sup>Market baseline resets at 9:30 AM ET | "
+            f"Weighted Portfolio Change: {latest_portfolio_change:+.2f}% | "
             f"Updated: {eastern_now.strftime('%Y-%m-%d %I:%M:%S %p ET')}</sup>"
         ),
         xaxis_title="Time — Eastern",
-        yaxis_title="% Change Since First Intraday Price",
+        yaxis_title="% Change Since 9:30 AM Market Open",
         hovermode="x unified",
         height=700,
         legend=dict(
@@ -239,10 +309,13 @@ def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
             xanchor="left",
             x=0,
         ),
-        margin=dict(l=40, r=40, t=100, b=40),
+        margin=dict(l=40, r=40, t=110, b=40),
     )
 
-    fig.update_xaxes(tickformat="%I:%M %p")
+    fig.update_xaxes(
+        tickformat="%I:%M %p",
+        range=[market_open, market_close],
+    )
 
     return fig
 
@@ -253,9 +326,11 @@ def make_summary_table(portfolio, pct_change):
 
     for symbol, weight in portfolio.items():
         latest_change = None
+        start_value_note = "No data"
 
         if symbol in pct_change.columns and not pct_change[symbol].dropna().empty:
             latest_change = pct_change[symbol].dropna().iloc[-1]
+            start_value_note = "9:30 AM ET baseline"
 
         normalized_weight = weight / total_weight * 100 if total_weight > 0 else 0
 
@@ -272,6 +347,7 @@ def make_summary_table(portfolio, pct_change):
                 "Normalized Weight %": normalized_weight,
                 "Latest % Change": latest_change,
                 "Weighted Contribution": contribution,
+                "Baseline": start_value_note,
             }
         )
 
@@ -360,6 +436,11 @@ st.sidebar.caption(
     "Note: MDA may need to be entered as MDA.TO for Yahoo Finance."
 )
 
+st.sidebar.caption(
+    "Chart uses regular market hours only: 9:30 AM to 4:00 PM ET."
+)
+
+
 # ============================================================
 # AUTO-REFRESH CONTROL
 # ============================================================
@@ -395,7 +476,11 @@ if messages:
             st.write(message)
 
 if closes.empty:
-    st.warning("No intraday data available for the selected tickers.")
+    st.warning(
+        "No regular-hours intraday data available for the selected tickers. "
+        "This can happen before 9:30 AM ET, after market close, on weekends, "
+        "or if Yahoo Finance has not published data yet."
+    )
     st.stop()
 
 pct_change = calculate_percent_change(closes)
@@ -413,6 +498,7 @@ if weighted_portfolio_change.empty:
     latest_portfolio_change = 0.0
 else:
     latest_portfolio_change = weighted_portfolio_change.dropna().iloc[-1]
+
 
 # ============================================================
 # TOP METRICS
@@ -450,6 +536,7 @@ with col4:
             "Off",
         )
 
+
 # ============================================================
 # CHART
 # ============================================================
@@ -461,6 +548,7 @@ fig = make_chart(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
 
 # ============================================================
 # SUMMARY TABLE
@@ -486,11 +574,18 @@ st.download_button(
     mime="text/csv",
 )
 
+
 # ============================================================
 # STATUS MESSAGE
 # ============================================================
 
 if auto_refresh:
-    st.caption(f"Auto-refresh is on. Refreshing every {refresh_seconds} seconds.")
+    st.caption(
+        f"Auto-refresh is on. Refreshing every {refresh_seconds} seconds. "
+        "The chart baseline resets each trading day at 9:30 AM ET."
+    )
 else:
-    st.caption("Auto-refresh is off. Use Refresh now to update the chart.")
+    st.caption(
+        "Auto-refresh is off. Use Refresh now to update the chart. "
+        "The chart baseline resets each trading day at 9:30 AM ET."
+    )
