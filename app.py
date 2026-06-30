@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
@@ -13,20 +14,32 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 DEFAULT_PORTFOLIO = [
-    ("MDA.TO", 25.0),
-    ("RKLB", 20.0),
-    ("LUNR", 7.5),
-    ("NOC", 12.5),
-    ("IRDM", 15.0),
-    ("ASTS", 7.5),
-    ("LHX", 12.5),
+    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 65.0},
+    {"Stock Symbol": "RKLB", "Initial Weighting %": 20.0, "Initial Shares": 20.0},
+    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 35.0},
+    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
+    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 30.0},
+    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 10.0},
+    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 5.0},
 ]
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 
-# Regular US market hours in Eastern Time
 MARKET_OPEN_TIME = dt_time(9, 30)
 MARKET_CLOSE_TIME = dt_time(16, 0)
+
+COLOR_SEQUENCE = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+]
 
 
 # ============================================================
@@ -41,7 +54,7 @@ st.set_page_config(
 
 st.title("Weighted Stock Portfolio Tracker")
 st.caption(
-    "Intraday tracker using regular market hours only: 9:30 AM to 4:00 PM Eastern Time."
+    "Tracks actual intraday portfolio value using number of shares, current prices, and percent change."
 )
 
 
@@ -50,45 +63,65 @@ st.caption(
 # ============================================================
 
 def normalize_ticker(ticker: str) -> str:
-    return ticker.strip().upper()
+    if pd.isna(ticker):
+        return ""
+    return str(ticker).strip().upper()
 
 
-def build_portfolio_from_inputs(tickers, weights):
-    portfolio = {}
+def create_default_input_df():
+    df = pd.DataFrame(DEFAULT_PORTFOLIO)
 
-    for ticker, weight in zip(tickers, weights):
-        ticker = normalize_ticker(ticker)
+    df["Current Price"] = None
+    df["Current Value"] = None
+    df["Current % Weighting"] = None
+    df["Current % Change"] = None
+    df["Dollar Gain/Loss Since Open"] = None
 
-        if ticker:
-            portfolio[ticker] = float(weight)
-
-    return portfolio
+    return df
 
 
-def validate_portfolio(portfolio):
-    if not portfolio:
-        return False, "Please enter at least one ticker."
+def clean_input_df(input_df):
+    df = input_df.copy()
 
-    total_weight = sum(portfolio.values())
+    df["Stock Symbol"] = df["Stock Symbol"].apply(normalize_ticker)
 
-    if total_weight <= 0:
-        return False, "Total portfolio weight must be greater than zero."
+    df["Initial Weighting %"] = pd.to_numeric(
+        df["Initial Weighting %"],
+        errors="coerce"
+    ).fillna(0.0)
 
-    for ticker, weight in portfolio.items():
-        if weight < 0:
-            return False, f"{ticker} has a negative weight. Please use zero or a positive number."
+    df["Initial Shares"] = pd.to_numeric(
+        df["Initial Shares"],
+        errors="coerce"
+    ).fillna(0.0)
+
+    df = df[df["Stock Symbol"] != ""].copy()
+    df = df[df["Initial Shares"] >= 0].copy()
+    df = df[df["Initial Weighting %"] >= 0].copy()
+
+    df.reset_index(drop=True, inplace=True)
+
+    return df
+
+
+def validate_portfolio_input(df):
+    if df.empty:
+        return False, "Please enter at least one valid stock symbol."
+
+    total_shares = df["Initial Shares"].sum()
+
+    if total_shares <= 0:
+        return False, "Total Initial Shares must be greater than zero."
+
+    duplicate_symbols = df[df["Stock Symbol"].duplicated()]["Stock Symbol"].tolist()
+
+    if duplicate_symbols:
+        return False, f"Duplicate ticker symbols found: {duplicate_symbols}"
 
     return True, ""
 
 
 def filter_regular_market_hours(data):
-    """
-    Keeps only regular market hours:
-    9:30 AM ET through 4:00 PM ET.
-
-    This makes the chart restart at market open each trading day.
-    """
-
     if data.empty:
         return data
 
@@ -130,20 +163,17 @@ def download_intraday_data(symbols_tuple):
                 messages.append(f"{symbol}: no intraday data available.")
                 continue
 
-            # Convert timestamps to US Eastern Time.
             if data.index.tz is None:
                 data.index = data.index.tz_localize("UTC").tz_convert(EASTERN_TZ)
             else:
                 data.index = data.index.tz_convert(EASTERN_TZ)
 
-            # Keep only 9:30 AM to 4:00 PM Eastern.
             data = filter_regular_market_hours(data)
 
             if data.empty:
                 messages.append(f"{symbol}: no regular-hours intraday data available yet.")
                 continue
 
-            # Handle either normal or MultiIndex columns.
             if isinstance(data.columns, pd.MultiIndex):
                 try:
                     close_series = data["Close"][symbol]
@@ -169,10 +199,7 @@ def download_intraday_data(symbols_tuple):
 
 def calculate_percent_change(closes):
     """
-    Calculates percent change from first valid regular-market intraday price.
-
-    Because the data has already been filtered to start at 9:30 AM ET,
-    this resets the baseline at market open each trading day.
+    Calculates percent change from the first valid regular-market intraday price.
     """
 
     pct_change = pd.DataFrame(index=closes.index)
@@ -183,65 +210,161 @@ def calculate_percent_change(closes):
         if valid_prices.empty:
             continue
 
-        start_price = valid_prices.iloc[0]
+        open_price = valid_prices.iloc[0]
 
-        if start_price == 0:
+        if open_price == 0:
             continue
 
-        pct_change[symbol] = (closes[symbol] - start_price) / start_price * 100
+        pct_change[symbol] = (closes[symbol] - open_price) / open_price * 100
 
     return pct_change
 
 
-def calculate_weighted_portfolio_change(pct_change, portfolio_weights):
+def calculate_dollar_values(closes, input_df):
     """
-    Calculates weighted portfolio/fund percent change.
+    Calculates actual dollar value over time:
 
-    Weights are normalized automatically, so the program still works
-    if the entered weights do not add exactly to 100%.
+        Stock Value = Number of Shares × Current Stock Price
     """
 
-    if pct_change.empty:
-        return pd.Series(dtype=float)
+    dollar_values = pd.DataFrame(index=closes.index)
 
-    total_weight = sum(portfolio_weights.values())
+    shares_by_symbol = dict(
+        zip(
+            input_df["Stock Symbol"],
+            input_df["Initial Shares"]
+        )
+    )
 
-    if total_weight <= 0:
-        return pd.Series(dtype=float)
-
-    weighted_change = pd.Series(0.0, index=pct_change.index)
-
-    for symbol in pct_change.columns:
-        if symbol not in portfolio_weights:
+    for symbol in closes.columns:
+        if symbol not in shares_by_symbol:
             continue
 
-        weight_decimal = portfolio_weights[symbol] / total_weight
+        shares = shares_by_symbol[symbol]
 
-        weighted_change = weighted_change.add(
-            pct_change[symbol] * weight_decimal,
-            fill_value=0,
+        dollar_values[symbol] = closes[symbol] * shares
+
+    return dollar_values
+
+
+def calculate_opening_values(closes, input_df):
+    """
+    Calculates opening value at the first regular-market price:
+
+        Opening Value = Number of Shares × First Regular-Market Price
+    """
+
+    opening_values = {}
+
+    shares_by_symbol = dict(
+        zip(
+            input_df["Stock Symbol"],
+            input_df["Initial Shares"]
         )
+    )
 
-    return weighted_change
+    for symbol in input_df["Stock Symbol"]:
+        if symbol in closes.columns and not closes[symbol].dropna().empty:
+            open_price = closes[symbol].dropna().iloc[0]
+            shares = shares_by_symbol.get(symbol, 0.0)
+            opening_values[symbol] = open_price * shares
+        else:
+            opening_values[symbol] = None
+
+    return opening_values
 
 
-def get_chart_day(index):
+def calculate_portfolio_total_value(dollar_values):
+    if dollar_values.empty:
+        return pd.Series(dtype=float)
+
+    return dollar_values.sum(axis=1, skipna=True)
+
+
+def calculate_portfolio_percent_change(portfolio_total_value, initial_total_value):
+    if portfolio_total_value.empty or initial_total_value <= 0:
+        return pd.Series(dtype=float)
+
+    return (portfolio_total_value - initial_total_value) / initial_total_value * 100
+
+
+def update_tracking_table(input_df, closes, dollar_values, pct_change, opening_values):
     """
-    Returns the trading date used for the chart x-axis range.
+    Adds current price, current value, current weighting, percent change,
+    and intraday gain/loss to the user input table.
     """
 
-    if index.empty:
-        return datetime.now(EASTERN_TZ).date()
+    output_df = input_df.copy()
 
-    return index.max().date()
+    current_prices = {}
+    current_values = {}
+    current_pct_changes = {}
+
+    for symbol in output_df["Stock Symbol"]:
+        if symbol in closes.columns and not closes[symbol].dropna().empty:
+            current_prices[symbol] = closes[symbol].dropna().iloc[-1]
+        else:
+            current_prices[symbol] = None
+
+        if symbol in dollar_values.columns and not dollar_values[symbol].dropna().empty:
+            current_values[symbol] = dollar_values[symbol].dropna().iloc[-1]
+        else:
+            current_values[symbol] = None
+
+        if symbol in pct_change.columns and not pct_change[symbol].dropna().empty:
+            current_pct_changes[symbol] = pct_change[symbol].dropna().iloc[-1]
+        else:
+            current_pct_changes[symbol] = None
+
+    current_total_value = sum(
+        value for value in current_values.values()
+        if value is not None and not pd.isna(value)
+    )
+
+    current_price_list = []
+    current_value_list = []
+    current_weighting_list = []
+    current_pct_change_list = []
+    gain_loss_list = []
+
+    for _, row in output_df.iterrows():
+        symbol = row["Stock Symbol"]
+
+        current_price = current_prices.get(symbol)
+        current_value = current_values.get(symbol)
+        current_pct_change = current_pct_changes.get(symbol)
+        opening_value = opening_values.get(symbol)
+
+        if current_value is not None and current_total_value > 0:
+            current_weighting = current_value / current_total_value * 100
+        else:
+            current_weighting = None
+
+        if current_value is not None and opening_value is not None:
+            gain_loss = current_value - opening_value
+        else:
+            gain_loss = None
+
+        current_price_list.append(current_price)
+        current_value_list.append(current_value)
+        current_weighting_list.append(current_weighting)
+        current_pct_change_list.append(current_pct_change)
+        gain_loss_list.append(gain_loss)
+
+    output_df["Current Price"] = current_price_list
+    output_df["Current Value"] = current_value_list
+    output_df["Current % Weighting"] = current_weighting_list
+    output_df["Current % Change"] = current_pct_change_list
+    output_df["Dollar Gain/Loss Since Open"] = gain_loss_list
+
+    return output_df
 
 
 def get_market_open_close_for_chart(index):
-    """
-    Builds 9:30 AM and 4:00 PM Eastern datetime values for the chart date.
-    """
-
-    chart_day = get_chart_day(index)
+    if index.empty:
+        chart_day = datetime.now(EASTERN_TZ).date()
+    else:
+        chart_day = index.max().date()
 
     market_open = datetime.combine(
         chart_day,
@@ -258,50 +381,125 @@ def get_market_open_close_for_chart(index):
     return market_open, market_close
 
 
-def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
-    fig = go.Figure()
+def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portfolio_pct_change):
+    """
+    Creates one chart:
+    - Left y-axis: total portfolio dollar value only
+    - Right y-axis: percent changes for each stock and the total portfolio
+    - Individual stock percent lines are dashed and colored
+    - Portfolio total value is solid black
+    - Portfolio percent change is dashed black
+    """
 
-    # Individual stock lines
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    color_by_symbol = {}
+
+    for idx, symbol in enumerate(pct_change.columns):
+        color_by_symbol[symbol] = COLOR_SEQUENCE[idx % len(COLOR_SEQUENCE)]
+
+    # ------------------------------------------------------------
+    # Portfolio total value - black solid line on left dollar axis
+    # ------------------------------------------------------------
+
+    if not portfolio_total_value.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=portfolio_total_value.index,
+                y=portfolio_total_value,
+                mode="lines",
+                name="Portfolio Total Value $",
+                line=dict(
+                    color="black",
+                    width=4.0,
+                    dash="solid",
+                ),
+                opacity=1.0,
+            ),
+            secondary_y=False,
+        )
+
+    # ------------------------------------------------------------
+    # Individual stock percent-change lines - dashed colored lines
+    # ------------------------------------------------------------
+
     for symbol in pct_change.columns:
+        color = color_by_symbol[symbol]
+
         fig.add_trace(
             go.Scatter(
                 x=pct_change.index,
                 y=pct_change[symbol],
                 mode="lines",
-                name=symbol,
-                line=dict(width=1.3),
+                name=f"{symbol} Change %",
+                line=dict(
+                    color=color,
+                    width=1.6,
+                    dash="dash",
+                ),
                 opacity=0.65,
-            )
+            ),
+            secondary_y=True,
         )
 
-    # Weighted portfolio line
-    if not weighted_portfolio_change.empty:
+    # ------------------------------------------------------------
+    # Portfolio total percent change - black dashed line
+    # ------------------------------------------------------------
+
+    if not portfolio_pct_change.empty:
         fig.add_trace(
             go.Scatter(
-                x=weighted_portfolio_change.index,
-                y=weighted_portfolio_change,
+                x=portfolio_pct_change.index,
+                y=portfolio_pct_change,
                 mode="lines",
-                name="Weighted Portfolio Fund",
-                line=dict(width=4, color="black"),
-            )
+                name="Portfolio Total Change %",
+                line=dict(
+                    color="black",
+                    width=2.8,
+                    dash="dash",
+                ),
+                opacity=0.75,
+            ),
+            secondary_y=True,
         )
 
-    fig.add_hline(y=0, line_width=1)
+    # Zero line for percent-change axis
+    fig.add_hline(y=0, line_width=1, secondary_y=True)
 
     eastern_now = datetime.now(EASTERN_TZ)
-    market_open, market_close = get_market_open_close_for_chart(pct_change.index)
+    market_open, market_close = get_market_open_close_for_chart(portfolio_total_value.index)
+
+    latest_portfolio_value = None
+    latest_portfolio_pct = None
+
+    if not portfolio_total_value.empty:
+        latest_portfolio_value = portfolio_total_value.dropna().iloc[-1]
+
+    if not portfolio_pct_change.empty:
+        latest_portfolio_pct = portfolio_pct_change.dropna().iloc[-1]
+
+    title_value = (
+        f"${latest_portfolio_value:,.2f}"
+        if latest_portfolio_value is not None
+        else "Unavailable"
+    )
+
+    title_pct = (
+        f"{latest_portfolio_pct:+.2f}%"
+        if latest_portfolio_pct is not None
+        else "Unavailable"
+    )
 
     fig.update_layout(
         title=(
-            "Intraday Performance — Individual Stocks + Weighted Portfolio Fund"
-            f"<br><sup>Market baseline resets at 9:30 AM ET | "
-            f"Weighted Portfolio Change: {latest_portfolio_change:+.2f}% | "
+            "Intraday Portfolio Value and Stock Percent Change"
+            f"<br><sup>Portfolio Value: {title_value} | "
+            f"Portfolio Change Since Open: {title_pct} | "
+            f"Baseline resets at 9:30 AM ET | "
             f"Updated: {eastern_now.strftime('%Y-%m-%d %I:%M:%S %p ET')}</sup>"
         ),
-        xaxis_title="Time — Eastern",
-        yaxis_title="% Change Since 9:30 AM Market Open",
         hovermode="x unified",
-        height=700,
+        height=760,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -309,116 +507,75 @@ def make_chart(pct_change, weighted_portfolio_change, latest_portfolio_change):
             xanchor="left",
             x=0,
         ),
-        margin=dict(l=40, r=40, t=110, b=40),
+        margin=dict(l=60, r=70, t=120, b=50),
     )
 
     fig.update_xaxes(
+        title_text="Time — Eastern",
         tickformat="%I:%M %p",
         range=[market_open, market_close],
+    )
+
+    fig.update_yaxes(
+        title_text="Portfolio Dollar Value",
+        tickprefix="$",
+        secondary_y=False,
+    )
+
+    fig.update_yaxes(
+        title_text="Percent Change Since Open",
+        ticksuffix="%",
+        secondary_y=True,
     )
 
     return fig
 
 
-def make_summary_table(portfolio, pct_change):
-    rows = []
-    total_weight = sum(portfolio.values())
+def format_tracking_table_for_display(df):
+    display_df = df.copy()
 
-    for symbol, weight in portfolio.items():
-        latest_change = None
-        start_value_note = "No data"
-
-        if symbol in pct_change.columns and not pct_change[symbol].dropna().empty:
-            latest_change = pct_change[symbol].dropna().iloc[-1]
-            start_value_note = "9:30 AM ET baseline"
-
-        normalized_weight = weight / total_weight * 100 if total_weight > 0 else 0
-
-        contribution = (
-            latest_change * normalized_weight / 100
-            if latest_change is not None
-            else None
-        )
-
-        rows.append(
-            {
-                "Ticker": symbol,
-                "Entered Weight %": weight,
-                "Normalized Weight %": normalized_weight,
-                "Latest % Change": latest_change,
-                "Weighted Contribution": contribution,
-                "Baseline": start_value_note,
-            }
-        )
-
-    summary_df = pd.DataFrame(rows)
-
-    return summary_df
-
-
-def format_summary_for_display(summary_df):
-    display_df = summary_df.copy()
-
-    numeric_columns = [
-        "Entered Weight %",
-        "Normalized Weight %",
-        "Latest % Change",
-        "Weighted Contribution",
+    money_columns = [
+        "Current Price",
+        "Current Value",
+        "Dollar Gain/Loss Since Open",
     ]
 
-    for column in numeric_columns:
-        display_df[column] = display_df[column].map(
-            lambda x: "" if pd.isna(x) else f"{x:.2f}"
-        )
+    percent_columns = [
+        "Initial Weighting %",
+        "Current % Weighting",
+        "Current % Change",
+    ]
+
+    share_columns = [
+        "Initial Shares",
+    ]
+
+    for column in money_columns:
+        if column in display_df.columns:
+            display_df[column] = display_df[column].map(
+                lambda x: "" if pd.isna(x) else f"${x:,.2f}"
+            )
+
+    for column in percent_columns:
+        if column in display_df.columns:
+            display_df[column] = display_df[column].map(
+                lambda x: "" if pd.isna(x) else f"{x:.2f}%"
+            )
+
+    for column in share_columns:
+        if column in display_df.columns:
+            display_df[column] = display_df[column].map(
+                lambda x: "" if pd.isna(x) else f"{x:,.4f}"
+            )
 
     return display_df
 
 
 # ============================================================
-# SIDEBAR INPUTS
+# SIDEBAR CONTROLS
 # ============================================================
 
-st.sidebar.header("Portfolio Inputs")
-
-ticker_inputs = []
-weight_inputs = []
-
-for i, (default_ticker, default_weight) in enumerate(DEFAULT_PORTFOLIO, start=1):
-    col1, col2 = st.sidebar.columns([1.2, 1])
-
-    with col1:
-        ticker_value = st.text_input(
-            f"Ticker {i}",
-            value=default_ticker,
-            key=f"ticker_{i}",
-        )
-
-    with col2:
-        weight_value = st.number_input(
-            f"Weight {i} %",
-            value=float(default_weight),
-            min_value=0.0,
-            step=0.5,
-            key=f"weight_{i}",
-        )
-
-    ticker_inputs.append(ticker_value)
-    weight_inputs.append(weight_value)
-
-portfolio_weights = build_portfolio_from_inputs(ticker_inputs, weight_inputs)
-is_valid, validation_message = validate_portfolio(portfolio_weights)
-
-total_entered_weight = sum(portfolio_weights.values())
-
-st.sidebar.divider()
-st.sidebar.metric("Total entered weight", f"{total_entered_weight:.2f}%")
-
-if abs(total_entered_weight - 100.0) > 0.01:
-    st.sidebar.warning(
-        "Weights do not add to 100%. The app will normalize them automatically."
-    )
-else:
-    st.sidebar.success("Weights add to 100%.")
+st.sidebar.header("Controls")
 
 refresh_seconds = st.sidebar.number_input(
     "Auto-refresh seconds",
@@ -429,21 +586,15 @@ refresh_seconds = st.sidebar.number_input(
 )
 
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
-
 manual_refresh = st.sidebar.button("Refresh now")
 
 st.sidebar.caption(
-    "Note: MDA may need to be entered as MDA.TO for Yahoo Finance."
+    "The chart uses regular market hours only: 9:30 AM to 4:00 PM ET."
 )
 
 st.sidebar.caption(
-    "Chart uses regular market hours only: 9:30 AM to 4:00 PM ET."
+    "MDA may need to be entered as MDA.TO for Yahoo Finance."
 )
-
-
-# ============================================================
-# AUTO-REFRESH CONTROL
-# ============================================================
 
 if auto_refresh:
     refresh_count = st_autorefresh(
@@ -458,14 +609,99 @@ if manual_refresh:
 
 
 # ============================================================
-# MAIN APP
+# DATA ENTRY PANEL
 # ============================================================
+
+st.subheader("Portfolio Data Entry and Current Tracking")
+
+# Use v3 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v3" not in st.session_state:
+    st.session_state["portfolio_input_df_v3"] = create_default_input_df()
+
+entry_df = st.data_editor(
+    st.session_state["portfolio_input_df_v3"],
+    num_rows="fixed",
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Stock Symbol": st.column_config.TextColumn(
+            "Stock Symbol",
+            help="Ticker symbol used by Yahoo Finance, for example RKLB, LHX, or MDA.TO.",
+            required=True,
+        ),
+        "Initial Weighting %": st.column_config.NumberColumn(
+            "Initial Weighting %",
+            min_value=0.0,
+            step=0.5,
+            format="%.2f",
+        ),
+        "Initial Shares": st.column_config.NumberColumn(
+            "Initial Shares",
+            min_value=0.0,
+            step=1.0,
+            format="%.4f",
+        ),
+        "Current Price": st.column_config.NumberColumn(
+            "Current Price",
+            format="$%.2f",
+            disabled=True,
+        ),
+        "Current Value": st.column_config.NumberColumn(
+            "Current Value",
+            format="$%.2f",
+            disabled=True,
+        ),
+        "Current % Weighting": st.column_config.NumberColumn(
+            "Current % Weighting",
+            format="%.2f%%",
+            disabled=True,
+        ),
+        "Current % Change": st.column_config.NumberColumn(
+            "Current % Change",
+            format="%.2f%%",
+            disabled=True,
+        ),
+        "Dollar Gain/Loss Since Open": st.column_config.NumberColumn(
+            "Dollar Gain/Loss Since Open",
+            format="$%.2f",
+            disabled=True,
+        ),
+    },
+    disabled=[
+        "Current Price",
+        "Current Value",
+        "Current % Weighting",
+        "Current % Change",
+        "Dollar Gain/Loss Since Open",
+    ],
+    key="portfolio_editor_v3",
+)
+
+input_df = clean_input_df(entry_df)
+is_valid, validation_message = validate_portfolio_input(input_df)
 
 if not is_valid:
     st.error(validation_message)
     st.stop()
 
-symbols = tuple(portfolio_weights.keys())
+st.session_state["portfolio_input_df_v3"] = entry_df.copy()
+
+total_initial_weight = input_df["Initial Weighting %"].sum()
+
+if abs(total_initial_weight - 100.0) > 0.01:
+    st.warning(
+        f"Initial Weighting totals {total_initial_weight:.2f}%, not 100%. "
+        "This does not stop the tracker, because actual portfolio value is based on Initial Shares."
+    )
+else:
+    st.success("Initial Weighting totals 100%.")
+
+symbols = tuple(input_df["Stock Symbol"].tolist())
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
 
 with st.spinner("Downloading intraday market data..."):
     closes, messages = download_intraday_data(symbols)
@@ -485,107 +721,140 @@ if closes.empty:
 
 pct_change = calculate_percent_change(closes)
 
-if pct_change.empty:
-    st.warning("Could not calculate percent changes from the downloaded data.")
-    st.stop()
-
-weighted_portfolio_change = calculate_weighted_portfolio_change(
-    pct_change=pct_change,
-    portfolio_weights=portfolio_weights,
+dollar_values = calculate_dollar_values(
+    closes=closes,
+    input_df=input_df,
 )
 
-if weighted_portfolio_change.empty:
-    latest_portfolio_change = 0.0
-else:
-    latest_portfolio_change = weighted_portfolio_change.dropna().iloc[-1]
+if dollar_values.empty:
+    st.warning("Could not calculate dollar values from the downloaded data.")
+    st.stop()
+
+opening_values = calculate_opening_values(
+    closes=closes,
+    input_df=input_df,
+)
+
+initial_total_value = sum(
+    value for value in opening_values.values()
+    if value is not None and not pd.isna(value)
+)
+
+portfolio_total_value = calculate_portfolio_total_value(dollar_values)
+
+portfolio_pct_change = calculate_portfolio_percent_change(
+    portfolio_total_value=portfolio_total_value,
+    initial_total_value=initial_total_value,
+)
+
+tracking_df = update_tracking_table(
+    input_df=input_df,
+    closes=closes,
+    dollar_values=dollar_values,
+    pct_change=pct_change,
+    opening_values=opening_values,
+)
 
 
 # ============================================================
 # TOP METRICS
 # ============================================================
 
-col1, col2, col3, col4 = st.columns(4)
+latest_portfolio_value = portfolio_total_value.dropna().iloc[-1]
+
+if not portfolio_pct_change.empty:
+    latest_portfolio_pct = portfolio_pct_change.dropna().iloc[-1]
+else:
+    latest_portfolio_pct = 0.0
+
+latest_gain_loss = latest_portfolio_value - initial_total_value
+
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     st.metric(
-        "Weighted portfolio change",
-        f"{latest_portfolio_change:+.2f}%",
+        "Opening portfolio value",
+        f"${initial_total_value:,.2f}",
     )
 
 with col2:
     st.metric(
-        "Active tickers",
-        len(pct_change.columns),
+        "Current portfolio value",
+        f"${latest_portfolio_value:,.2f}",
+        delta=f"${latest_gain_loss:,.2f}",
     )
 
 with col3:
     st.metric(
-        "Last update",
-        datetime.now(EASTERN_TZ).strftime("%I:%M:%S %p ET"),
+        "Portfolio % change since open",
+        f"{latest_portfolio_pct:+.2f}%",
     )
 
 with col4:
+    st.metric(
+        "Active tickers",
+        len(dollar_values.columns),
+    )
+
+with col5:
     if auto_refresh:
-        st.metric(
-            "Refresh count",
-            refresh_count,
-        )
+        st.metric("Refresh count", refresh_count)
     else:
-        st.metric(
-            "Auto-refresh",
-            "Off",
-        )
+        st.metric("Auto-refresh", "Off")
+
+
+# ============================================================
+# UPDATED TRACKING TABLE
+# ============================================================
+
+st.subheader("Current Portfolio Status")
+
+display_tracking_df = format_tracking_table_for_display(tracking_df)
+
+st.dataframe(
+    display_tracking_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+csv_data = tracking_df.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    label="Download current portfolio status CSV",
+    data=csv_data,
+    file_name="current_portfolio_status.csv",
+    mime="text/csv",
+)
 
 
 # ============================================================
 # CHART
 # ============================================================
 
-fig = make_chart(
+fig = make_dual_axis_chart(
+    dollar_values=dollar_values,
     pct_change=pct_change,
-    weighted_portfolio_change=weighted_portfolio_change,
-    latest_portfolio_change=latest_portfolio_change,
+    portfolio_total_value=portfolio_total_value,
+    portfolio_pct_change=portfolio_pct_change,
 )
 
 st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
-# SUMMARY TABLE
-# ============================================================
-
-summary_df = make_summary_table(
-    portfolio=portfolio_weights,
-    pct_change=pct_change,
-)
-
-st.subheader("Portfolio Summary")
-
-display_df = format_summary_for_display(summary_df)
-
-st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-csv_data = summary_df.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    label="Download portfolio summary CSV",
-    data=csv_data,
-    file_name="weighted_portfolio_summary.csv",
-    mime="text/csv",
-)
-
-
-# ============================================================
 # STATUS MESSAGE
 # ============================================================
 
+st.caption(
+    "Dollar values are calculated as Initial Shares × Current Price. "
+    "Percent change is measured from the first regular-market price at or after 9:30 AM ET."
+)
+
 if auto_refresh:
     st.caption(
-        f"Auto-refresh is on. Refreshing every {refresh_seconds} seconds. "
-        "The chart baseline resets each trading day at 9:30 AM ET."
+        f"Auto-refresh is on. Refreshing every {refresh_seconds} seconds."
     )
 else:
     st.caption(
-        "Auto-refresh is off. Use Refresh now to update the chart. "
-        "The chart baseline resets each trading day at 9:30 AM ET."
+        "Auto-refresh is off. Use Refresh now to update the chart."
     )
