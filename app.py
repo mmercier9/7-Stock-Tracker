@@ -379,16 +379,12 @@ def get_market_open_close_for_chart(index):
     )
 
     return market_open, market_close
-
-
 def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portfolio_pct_change):
     """
     Creates one chart:
     - Left y-axis: total portfolio dollar value only
     - Right y-axis: percent changes for each stock and the total portfolio
-    - Individual stock percent lines are dashed and colored
-    - Portfolio total value is solid black
-    - Portfolio percent change is dashed black
+    - Legend moved below chart to avoid title/legend overlap
     """
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -408,7 +404,7 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
                 x=portfolio_total_value.index,
                 y=portfolio_total_value,
                 mode="lines",
-                name="Portfolio Total Value $",
+                name="Portfolio $",
                 line=dict(
                     color="black",
                     width=4.0,
@@ -431,7 +427,7 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
                 x=pct_change.index,
                 y=pct_change[symbol],
                 mode="lines",
-                name=f"{symbol} Change %",
+                name=f"{symbol} %",
                 line=dict(
                     color=color,
                     width=1.6,
@@ -452,7 +448,7 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
                 x=portfolio_pct_change.index,
                 y=portfolio_pct_change,
                 mode="lines",
-                name="Portfolio Total Change %",
+                name="Portfolio %",
                 line=dict(
                     color="black",
                     width=2.8,
@@ -463,7 +459,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
             secondary_y=True,
         )
 
-    # Zero line for percent-change axis
     fig.add_hline(y=0, line_width=1, secondary_y=True)
 
     eastern_now = datetime.now(EASTERN_TZ)
@@ -491,23 +486,38 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
     )
 
     fig.update_layout(
-        title=(
-            "Intraday Portfolio Value and Stock Percent Change"
-            f"<br><sup>Portfolio Value: {title_value} | "
-            f"Portfolio Change Since Open: {title_pct} | "
-            f"Baseline resets at 9:30 AM ET | "
-            f"Updated: {eastern_now.strftime('%Y-%m-%d %I:%M:%S %p ET')}</sup>"
+        title=dict(
+            text=(
+                "Intraday Portfolio Value and Stock Percent Change"
+                f"<br><sup>Portfolio Value: {title_value} | "
+                f"Portfolio Change Since Open: {title_pct} | "
+                f"Baseline resets at 9:30 AM ET | "
+                f"Updated: {eastern_now.strftime('%Y-%m-%d %I:%M:%S %p ET')}</sup>"
+            ),
+            x=0.01,
+            xanchor="left",
         ),
         hovermode="x unified",
-        height=760,
+        height=820,
+
+        # Move legend below chart area
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.02,
+            yanchor="top",
+            y=-0.18,
             xanchor="left",
             x=0,
+            font=dict(size=11),
+            traceorder="normal",
         ),
-        margin=dict(l=60, r=70, t=120, b=50),
+
+        # More room at top for title and bottom for legend
+        margin=dict(
+            l=70,
+            r=80,
+            t=105,
+            b=150,
+        ),
     )
 
     fig.update_xaxes(
@@ -529,6 +539,7 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
     )
 
     return fig
+
 
 
 def format_tracking_table_for_display(df):
