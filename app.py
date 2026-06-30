@@ -14,13 +14,13 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 DEFAULT_PORTFOLIO = [
-    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 65.0},
+    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 10.0},
     {"Stock Symbol": "RKLB", "Initial Weighting %": 20.0, "Initial Shares": 20.0},
-    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 35.0},
-    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
-    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 30.0},
-    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 10.0},
-    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 5.0},
+    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 25.0},
+    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 2.0},
+    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 15.0},
+    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 15.0},
+    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
 ]
 
 EASTERN_TZ = ZoneInfo("America/New_York")
@@ -54,7 +54,7 @@ st.set_page_config(
 
 st.title("Weighted Stock Portfolio Tracker")
 st.caption(
-    "Tracks actual intraday portfolio value using number of shares, current prices, and percent change."
+    "Tracks actual intraday portfolio value using number of shares, current prices, percent change, and approximate signed volume."
 )
 
 
@@ -137,7 +137,7 @@ def filter_regular_market_hours(data):
 @st.cache_data(ttl=15, show_spinner=False)
 def download_intraday_data(symbols_tuple):
     """
-    Downloads 1-minute intraday close prices from yfinance.
+    Downloads 1-minute intraday close prices and volume from yfinance.
 
     Timestamps are converted to Eastern Time and filtered to regular
     market hours only.
@@ -145,6 +145,7 @@ def download_intraday_data(symbols_tuple):
 
     symbols = list(symbols_tuple)
     closes = pd.DataFrame()
+    volumes = pd.DataFrame()
     messages = []
 
     for symbol in symbols:
@@ -177,35 +178,64 @@ def download_intraday_data(symbols_tuple):
             if isinstance(data.columns, pd.MultiIndex):
                 try:
                     close_series = data["Close"][symbol]
+                    volume_series = data["Volume"][symbol]
                 except Exception:
-                    messages.append(f"{symbol}: could not read Close data.")
+                    messages.append(f"{symbol}: could not read Close/Volume data.")
                     continue
             else:
                 close_series = data["Close"]
+                volume_series = data["Volume"] if "Volume" in data.columns else pd.Series(0, index=data.index)
 
-            close_series = close_series.dropna()
+            combined = pd.DataFrame(
+                {
+                    "Close": close_series,
+                    "Volume": volume_series,
+                }
+            ).dropna(subset=["Close"])
 
-            if close_series.empty:
-                messages.append(f"{symbol}: no close data available.")
+            if combined.empty:
+                messages.append(f"{symbol}: no usable close data available.")
                 continue
 
-            closes[symbol] = close_series
+            closes[symbol] = combined["Close"]
+            volumes[symbol] = combined["Volume"].fillna(0)
 
         except Exception as e:
             messages.append(f"{symbol}: error downloading data: {e}")
 
-    return closes, messages
+    return closes, volumes, messages
+
+
+def forward_fill_intraday_prices(closes):
+    """
+    Forward-fills missing 1-minute quote gaps.
+
+    This prevents the portfolio total from dropping sharply when one
+    ticker temporarily has no quote at a given minute.
+    """
+
+    if closes.empty:
+        return closes
+
+    filled_closes = closes.copy().sort_index()
+    filled_closes = filled_closes.ffill()
+
+    return filled_closes
 
 
 def calculate_percent_change(closes):
     """
     Calculates percent change from the first valid regular-market intraday price.
+
+    Missing quote gaps are forward-filled to prevent artificial chart dropouts.
     """
 
-    pct_change = pd.DataFrame(index=closes.index)
+    filled_closes = forward_fill_intraday_prices(closes)
 
-    for symbol in closes.columns:
-        valid_prices = closes[symbol].dropna()
+    pct_change = pd.DataFrame(index=filled_closes.index)
+
+    for symbol in filled_closes.columns:
+        valid_prices = filled_closes[symbol].dropna()
 
         if valid_prices.empty:
             continue
@@ -215,7 +245,7 @@ def calculate_percent_change(closes):
         if open_price == 0:
             continue
 
-        pct_change[symbol] = (closes[symbol] - open_price) / open_price * 100
+        pct_change[symbol] = (filled_closes[symbol] - open_price) / open_price * 100
 
     return pct_change
 
@@ -225,9 +255,13 @@ def calculate_dollar_values(closes, input_df):
     Calculates actual dollar value over time:
 
         Stock Value = Number of Shares × Current Stock Price
+
+    Missing quote gaps are forward-filled to prevent artificial portfolio dropouts.
     """
 
-    dollar_values = pd.DataFrame(index=closes.index)
+    filled_closes = forward_fill_intraday_prices(closes)
+
+    dollar_values = pd.DataFrame(index=filled_closes.index)
 
     shares_by_symbol = dict(
         zip(
@@ -236,13 +270,13 @@ def calculate_dollar_values(closes, input_df):
         )
     )
 
-    for symbol in closes.columns:
+    for symbol in filled_closes.columns:
         if symbol not in shares_by_symbol:
             continue
 
         shares = shares_by_symbol[symbol]
 
-        dollar_values[symbol] = closes[symbol] * shares
+        dollar_values[symbol] = filled_closes[symbol] * shares
 
     return dollar_values
 
@@ -254,6 +288,8 @@ def calculate_opening_values(closes, input_df):
         Opening Value = Number of Shares × First Regular-Market Price
     """
 
+    filled_closes = forward_fill_intraday_prices(closes)
+
     opening_values = {}
 
     shares_by_symbol = dict(
@@ -264,8 +300,8 @@ def calculate_opening_values(closes, input_df):
     )
 
     for symbol in input_df["Stock Symbol"]:
-        if symbol in closes.columns and not closes[symbol].dropna().empty:
-            open_price = closes[symbol].dropna().iloc[0]
+        if symbol in filled_closes.columns and not filled_closes[symbol].dropna().empty:
+            open_price = filled_closes[symbol].dropna().iloc[0]
             shares = shares_by_symbol.get(symbol, 0.0)
             opening_values[symbol] = open_price * shares
         else:
@@ -275,10 +311,20 @@ def calculate_opening_values(closes, input_df):
 
 
 def calculate_portfolio_total_value(dollar_values):
+    """
+    Calculates total portfolio value.
+
+    Forward-fills component values so a missing 1-minute quote does not
+    temporarily remove a stock from the portfolio total.
+    """
+
     if dollar_values.empty:
         return pd.Series(dtype=float)
 
-    return dollar_values.sum(axis=1, skipna=True)
+    filled_values = dollar_values.copy().sort_index()
+    filled_values = filled_values.ffill()
+
+    return filled_values.sum(axis=1, skipna=False)
 
 
 def calculate_portfolio_percent_change(portfolio_total_value, initial_total_value):
@@ -288,11 +334,87 @@ def calculate_portfolio_percent_change(portfolio_total_value, initial_total_valu
     return (portfolio_total_value - initial_total_value) / initial_total_value * 100
 
 
+def calculate_signed_volume(closes, volumes):
+    """
+    Approximates net purchase/sale volume using price direction:
+
+    - If current minute close > prior minute close: positive volume / purchase pressure
+    - If current minute close < prior minute close: negative volume / sale pressure
+    - If unchanged: zero
+
+    This is not true bid/ask trade classification. It is a practical indicator
+    using available yfinance 1-minute OHLCV data.
+    """
+
+    if closes.empty or volumes.empty:
+        return pd.DataFrame()
+
+    filled_closes = forward_fill_intraday_prices(closes)
+
+    aligned_volumes = volumes.copy().sort_index()
+    aligned_volumes = aligned_volumes.reindex(filled_closes.index).fillna(0)
+
+    signed_volume = pd.DataFrame(index=filled_closes.index)
+
+    for symbol in filled_closes.columns:
+        if symbol not in aligned_volumes.columns:
+            continue
+
+        price_change = filled_closes[symbol].diff()
+
+        direction = price_change.apply(
+            lambda x: 1 if x > 0 else (-1 if x < 0 else 0)
+        )
+
+        signed_volume[symbol] = aligned_volumes[symbol] * direction
+
+    return signed_volume
+
+
+def calculate_signed_dollar_volume(closes, signed_volume):
+    """
+    Converts signed share volume to signed dollar volume:
+
+        Signed Dollar Volume = Signed Share Volume × Current Price
+    """
+
+    if closes.empty or signed_volume.empty:
+        return pd.DataFrame()
+
+    filled_closes = forward_fill_intraday_prices(closes)
+
+    signed_dollar_volume = pd.DataFrame(index=signed_volume.index)
+
+    for symbol in signed_volume.columns:
+        if symbol not in filled_closes.columns:
+            continue
+
+        price_series = filled_closes[symbol].reindex(signed_volume.index).ffill()
+
+        signed_dollar_volume[symbol] = signed_volume[symbol] * price_series
+
+    return signed_dollar_volume
+
+
+def calculate_portfolio_signed_dollar_volume(signed_dollar_volume):
+    """
+    Sums signed dollar volume across all tickers to estimate overall
+    portfolio-level buy/sell pressure.
+    """
+
+    if signed_dollar_volume.empty:
+        return pd.Series(dtype=float)
+
+    return signed_dollar_volume.sum(axis=1, skipna=True)
+
+
 def update_tracking_table(input_df, closes, dollar_values, pct_change, opening_values):
     """
     Adds current price, current value, current weighting, percent change,
     and intraday gain/loss to the user input table.
     """
+
+    filled_closes = forward_fill_intraday_prices(closes)
 
     output_df = input_df.copy()
 
@@ -301,8 +423,8 @@ def update_tracking_table(input_df, closes, dollar_values, pct_change, opening_v
     current_pct_changes = {}
 
     for symbol in output_df["Stock Symbol"]:
-        if symbol in closes.columns and not closes[symbol].dropna().empty:
-            current_prices[symbol] = closes[symbol].dropna().iloc[-1]
+        if symbol in filled_closes.columns and not filled_closes[symbol].dropna().empty:
+            current_prices[symbol] = filled_closes[symbol].dropna().iloc[-1]
         else:
             current_prices[symbol] = None
 
@@ -379,12 +501,16 @@ def get_market_open_close_for_chart(index):
     )
 
     return market_open, market_close
+
+
 def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portfolio_pct_change):
     """
     Creates one chart:
     - Left y-axis: total portfolio dollar value only
     - Right y-axis: percent changes for each stock and the total portfolio
-    - Legend moved below chart to avoid title/legend overlap
+    - Individual stock percent lines are dashed and colored
+    - Portfolio total value is solid black
+    - Portfolio percent change is dashed black
     """
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -393,10 +519,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
 
     for idx, symbol in enumerate(pct_change.columns):
         color_by_symbol[symbol] = COLOR_SEQUENCE[idx % len(COLOR_SEQUENCE)]
-
-    # ------------------------------------------------------------
-    # Portfolio total value - black solid line on left dollar axis
-    # ------------------------------------------------------------
 
     if not portfolio_total_value.empty:
         fig.add_trace(
@@ -414,10 +536,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
             ),
             secondary_y=False,
         )
-
-    # ------------------------------------------------------------
-    # Individual stock percent-change lines - dashed colored lines
-    # ------------------------------------------------------------
 
     for symbol in pct_change.columns:
         color = color_by_symbol[symbol]
@@ -437,10 +555,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
             ),
             secondary_y=True,
         )
-
-    # ------------------------------------------------------------
-    # Portfolio total percent change - black dashed line
-    # ------------------------------------------------------------
 
     if not portfolio_pct_change.empty:
         fig.add_trace(
@@ -499,8 +613,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
         ),
         hovermode="x unified",
         height=820,
-
-        # Move legend below chart area
         legend=dict(
             orientation="h",
             yanchor="top",
@@ -510,8 +622,6 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
             font=dict(size=11),
             traceorder="normal",
         ),
-
-        # More room at top for title and bottom for legend
         margin=dict(
             l=70,
             r=80,
@@ -540,6 +650,132 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
 
     return fig
 
+
+def make_volume_indicator_chart(signed_volume, portfolio_signed_dollar_volume):
+    """
+    Creates a row-based volume pressure chart:
+    - One row for each stock symbol
+    - One final row for overall portfolio buy/sell pressure
+    - Green bars = estimated purchase pressure
+    - Red bars = estimated sale pressure
+    """
+
+    if signed_volume.empty:
+        return go.Figure()
+
+    symbols = list(signed_volume.columns)
+    row_titles = symbols + ["Portfolio"]
+
+    fig = make_subplots(
+        rows=len(row_titles),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.025,
+        row_titles=row_titles,
+    )
+
+    # Individual symbol signed volume rows
+    for row_index, symbol in enumerate(symbols, start=1):
+        series = signed_volume[symbol].fillna(0)
+
+        colors = [
+            "green" if value > 0 else ("red" if value < 0 else "gray")
+            for value in series
+        ]
+
+        fig.add_trace(
+            go.Bar(
+                x=series.index,
+                y=series,
+                marker_color=colors,
+                name=f"{symbol} signed volume",
+                showlegend=False,
+            ),
+            row=row_index,
+            col=1,
+        )
+
+        fig.add_hline(
+            y=0,
+            line_width=1,
+            line_color="gray",
+            row=row_index,
+            col=1,
+        )
+
+    # Portfolio signed dollar volume row
+    portfolio_row = len(row_titles)
+
+    if not portfolio_signed_dollar_volume.empty:
+        portfolio_series = portfolio_signed_dollar_volume.fillna(0)
+
+        portfolio_colors = [
+            "green" if value > 0 else ("red" if value < 0 else "gray")
+            for value in portfolio_series
+        ]
+
+        fig.add_trace(
+            go.Bar(
+                x=portfolio_series.index,
+                y=portfolio_series,
+                marker_color=portfolio_colors,
+                name="Portfolio signed dollar volume",
+                showlegend=False,
+            ),
+            row=portfolio_row,
+            col=1,
+        )
+
+        fig.add_hline(
+            y=0,
+            line_width=1,
+            line_color="gray",
+            row=portfolio_row,
+            col=1,
+        )
+
+    eastern_now = datetime.now(EASTERN_TZ)
+    market_open, market_close = get_market_open_close_for_chart(signed_volume.index)
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "Estimated Purchase / Sale Volume Pressure"
+                f"<br><sup>Green = estimated purchase pressure | "
+                f"Red = estimated sale pressure | "
+                f"Updated: {eastern_now.strftime('%Y-%m-%d %I:%M:%S %p ET')}</sup>"
+            ),
+            x=0.01,
+            xanchor="left",
+        ),
+        height=max(520, 115 * len(row_titles)),
+        margin=dict(
+            l=90,
+            r=50,
+            t=95,
+            b=60,
+        ),
+        bargap=0.05,
+    )
+
+    fig.update_xaxes(
+        tickformat="%I:%M %p",
+        range=[market_open, market_close],
+    )
+
+    fig.update_yaxes(
+        title_text="Signed volume",
+        showticklabels=True,
+    )
+
+    # Label the portfolio row differently because it is signed dollar volume
+    fig.update_yaxes(
+        title_text="Signed $ volume",
+        row=portfolio_row,
+        col=1,
+    )
+
+    return fig
 
 
 def format_tracking_table_for_display(df):
@@ -625,12 +861,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v3 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v3" not in st.session_state:
-    st.session_state["portfolio_input_df_v3"] = create_default_input_df()
+# Use v5 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v5" not in st.session_state:
+    st.session_state["portfolio_input_df_v5"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v3"],
+    st.session_state["portfolio_input_df_v5"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -685,7 +921,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v3",
+    key="portfolio_editor_v5",
 )
 
 input_df = clean_input_df(entry_df)
@@ -695,7 +931,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v3"] = entry_df.copy()
+st.session_state["portfolio_input_df_v5"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -715,7 +951,7 @@ symbols = tuple(input_df["Stock Symbol"].tolist())
 # ============================================================
 
 with st.spinner("Downloading intraday market data..."):
-    closes, messages = download_intraday_data(symbols)
+    closes, volumes, messages = download_intraday_data(symbols)
 
 if messages:
     with st.expander("Data messages", expanded=False):
@@ -764,6 +1000,20 @@ tracking_df = update_tracking_table(
     dollar_values=dollar_values,
     pct_change=pct_change,
     opening_values=opening_values,
+)
+
+signed_volume = calculate_signed_volume(
+    closes=closes,
+    volumes=volumes,
+)
+
+signed_dollar_volume = calculate_signed_dollar_volume(
+    closes=closes,
+    signed_volume=signed_volume,
+)
+
+portfolio_signed_dollar_volume = calculate_portfolio_signed_dollar_volume(
+    signed_dollar_volume=signed_dollar_volume,
 )
 
 
@@ -839,7 +1089,7 @@ st.download_button(
 
 
 # ============================================================
-# CHART
+# TREND CHART
 # ============================================================
 
 fig = make_dual_axis_chart(
@@ -853,11 +1103,32 @@ st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
+# VOLUME INDICATOR CHART
+# ============================================================
+
+st.subheader("Estimated Purchase / Sale Volume Pressure")
+
+st.caption(
+    "This indicator approximates buy/sell pressure using minute-to-minute price direction. "
+    "Green bars mean price rose during that minute, red bars mean price fell during that minute. "
+    "This is not true bid/ask order-flow data."
+)
+
+volume_fig = make_volume_indicator_chart(
+    signed_volume=signed_volume,
+    portfolio_signed_dollar_volume=portfolio_signed_dollar_volume,
+)
+
+st.plotly_chart(volume_fig, use_container_width=True)
+
+
+# ============================================================
 # STATUS MESSAGE
 # ============================================================
 
 st.caption(
     "Dollar values are calculated as Initial Shares × Current Price. "
+    "Missing 1-minute quote gaps are forward-filled to avoid artificial portfolio dropouts. "
     "Percent change is measured from the first regular-market price at or after 9:30 AM ET."
 )
 
