@@ -14,13 +14,13 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 DEFAULT_PORTFOLIO = [
-    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 10.0},
+    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 65.0},
     {"Stock Symbol": "RKLB", "Initial Weighting %": 20.0, "Initial Shares": 20.0},
-    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 25.0},
-    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 2.0},
-    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 15.0},
-    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 15.0},
-    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
+    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 35.0},
+    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
+    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 30.0},
+    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 10.0},
+    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 5.0},
 ]
 
 EASTERN_TZ = ZoneInfo("America/New_York")
@@ -197,36 +197,15 @@ def download_intraday_data(symbols_tuple):
     return closes, messages
 
 
-def forward_fill_intraday_prices(closes):
-    """
-    Forward-fills missing 1-minute quote gaps.
-
-    This prevents the portfolio total from dropping sharply when one
-    ticker temporarily has no quote at a given minute.
-    """
-
-    if closes.empty:
-        return closes
-
-    filled_closes = closes.copy().sort_index()
-    filled_closes = filled_closes.ffill()
-
-    return filled_closes
-
-
 def calculate_percent_change(closes):
     """
     Calculates percent change from the first valid regular-market intraday price.
-
-    Missing quote gaps are forward-filled to prevent artificial chart dropouts.
     """
 
-    filled_closes = forward_fill_intraday_prices(closes)
+    pct_change = pd.DataFrame(index=closes.index)
 
-    pct_change = pd.DataFrame(index=filled_closes.index)
-
-    for symbol in filled_closes.columns:
-        valid_prices = filled_closes[symbol].dropna()
+    for symbol in closes.columns:
+        valid_prices = closes[symbol].dropna()
 
         if valid_prices.empty:
             continue
@@ -236,7 +215,7 @@ def calculate_percent_change(closes):
         if open_price == 0:
             continue
 
-        pct_change[symbol] = (filled_closes[symbol] - open_price) / open_price * 100
+        pct_change[symbol] = (closes[symbol] - open_price) / open_price * 100
 
     return pct_change
 
@@ -246,13 +225,9 @@ def calculate_dollar_values(closes, input_df):
     Calculates actual dollar value over time:
 
         Stock Value = Number of Shares × Current Stock Price
-
-    Missing quote gaps are forward-filled to prevent artificial portfolio dropouts.
     """
 
-    filled_closes = forward_fill_intraday_prices(closes)
-
-    dollar_values = pd.DataFrame(index=filled_closes.index)
+    dollar_values = pd.DataFrame(index=closes.index)
 
     shares_by_symbol = dict(
         zip(
@@ -261,13 +236,13 @@ def calculate_dollar_values(closes, input_df):
         )
     )
 
-    for symbol in filled_closes.columns:
+    for symbol in closes.columns:
         if symbol not in shares_by_symbol:
             continue
 
         shares = shares_by_symbol[symbol]
 
-        dollar_values[symbol] = filled_closes[symbol] * shares
+        dollar_values[symbol] = closes[symbol] * shares
 
     return dollar_values
 
@@ -279,8 +254,6 @@ def calculate_opening_values(closes, input_df):
         Opening Value = Number of Shares × First Regular-Market Price
     """
 
-    filled_closes = forward_fill_intraday_prices(closes)
-
     opening_values = {}
 
     shares_by_symbol = dict(
@@ -291,8 +264,8 @@ def calculate_opening_values(closes, input_df):
     )
 
     for symbol in input_df["Stock Symbol"]:
-        if symbol in filled_closes.columns and not filled_closes[symbol].dropna().empty:
-            open_price = filled_closes[symbol].dropna().iloc[0]
+        if symbol in closes.columns and not closes[symbol].dropna().empty:
+            open_price = closes[symbol].dropna().iloc[0]
             shares = shares_by_symbol.get(symbol, 0.0)
             opening_values[symbol] = open_price * shares
         else:
@@ -302,20 +275,10 @@ def calculate_opening_values(closes, input_df):
 
 
 def calculate_portfolio_total_value(dollar_values):
-    """
-    Calculates total portfolio value.
-
-    Forward-fills component values so a missing 1-minute quote does not
-    temporarily remove a stock from the portfolio total.
-    """
-
     if dollar_values.empty:
         return pd.Series(dtype=float)
 
-    filled_values = dollar_values.copy().sort_index()
-    filled_values = filled_values.ffill()
-
-    return filled_values.sum(axis=1, skipna=False)
+    return dollar_values.sum(axis=1, skipna=True)
 
 
 def calculate_portfolio_percent_change(portfolio_total_value, initial_total_value):
@@ -331,8 +294,6 @@ def update_tracking_table(input_df, closes, dollar_values, pct_change, opening_v
     and intraday gain/loss to the user input table.
     """
 
-    filled_closes = forward_fill_intraday_prices(closes)
-
     output_df = input_df.copy()
 
     current_prices = {}
@@ -340,8 +301,8 @@ def update_tracking_table(input_df, closes, dollar_values, pct_change, opening_v
     current_pct_changes = {}
 
     for symbol in output_df["Stock Symbol"]:
-        if symbol in filled_closes.columns and not filled_closes[symbol].dropna().empty:
-            current_prices[symbol] = filled_closes[symbol].dropna().iloc[-1]
+        if symbol in closes.columns and not closes[symbol].dropna().empty:
+            current_prices[symbol] = closes[symbol].dropna().iloc[-1]
         else:
             current_prices[symbol] = None
 
@@ -653,12 +614,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v4 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v4" not in st.session_state:
-    st.session_state["portfolio_input_df_v4"] = create_default_input_df()
+# Use v3 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v3" not in st.session_state:
+    st.session_state["portfolio_input_df_v3"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v4"],
+    st.session_state["portfolio_input_df_v3"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -713,7 +674,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v4",
+    key="portfolio_editor_v3",
 )
 
 input_df = clean_input_df(entry_df)
@@ -723,7 +684,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v4"] = entry_df.copy()
+st.session_state["portfolio_input_df_v3"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -886,7 +847,6 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.caption(
     "Dollar values are calculated as Initial Shares × Current Price. "
-    "Missing 1-minute quote gaps are forward-filled to avoid artificial portfolio dropouts. "
     "Percent change is measured from the first regular-market price at or after 9:30 AM ET."
 )
 
