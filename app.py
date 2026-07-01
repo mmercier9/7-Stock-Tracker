@@ -134,25 +134,108 @@ def filter_regular_market_hours(data):
     )
 
 
+def filter_today_eastern(data):
+    """
+    Keeps only today's Eastern Time date.
+
+    This prevents stale prior-session data from closed exchanges from being
+    mixed with today's active data.
+    """
+
+    if data.empty:
+        return data
+
+    today_et = datetime.now(EASTERN_TZ).date()
+    return data[data.index.date == today_et]
+
+
+def extract_close_and_volume(data, symbol):
+    """
+    Extracts Close and Volume from either normal yfinance columns or MultiIndex columns.
+    """
+
+    if data.empty:
+        return None, None
+
+    close_series = None
+    volume_series = None
+
+    if isinstance(data.columns, pd.MultiIndex):
+        # Most common MultiIndex format: ("Close", "AAPL")
+        if ("Close", symbol) in data.columns:
+            close_series = data[("Close", symbol)]
+        elif (symbol, "Close") in data.columns:
+            close_series = data[(symbol, "Close")]
+        else:
+            try:
+                close_series = data["Close"][symbol]
+            except Exception:
+                try:
+                    close_series = data[symbol]["Close"]
+                except Exception:
+                    close_series = None
+
+        if ("Volume", symbol) in data.columns:
+            volume_series = data[("Volume", symbol)]
+        elif (symbol, "Volume") in data.columns:
+            volume_series = data[(symbol, "Volume")]
+        else:
+            try:
+                volume_series = data["Volume"][symbol]
+            except Exception:
+                try:
+                    volume_series = data[symbol]["Volume"]
+                except Exception:
+                    volume_series = None
+
+    else:
+        if "Close" in data.columns:
+            close_series = data["Close"]
+
+        if "Volume" in data.columns:
+            volume_series = data["Volume"]
+
+    if close_series is None:
+        return None, None
+
+    if volume_series is None:
+        volume_series = pd.Series(0, index=close_series.index)
+
+    return close_series, volume_series
+
+
 @st.cache_data(ttl=15, show_spinner=False)
-def download_intraday_data(symbols_tuple):
+def download_one_symbol_intraday_data(symbol):
     """
-    Downloads 1-minute intraday close prices and volume from yfinance.
+    Downloads one ticker independently.
 
-    Timestamps are converted to Eastern Time and filtered to regular
-    market hours only.
+    This prevents one symbol's exchange calendar, timezone, or timestamp index
+    from controlling the data returned for another symbol.
     """
 
-    symbols = list(symbols_tuple)
-    closes = pd.DataFrame()
-    volumes = pd.DataFrame()
     messages = []
+    today_et = datetime.now(EASTERN_TZ).date()
 
-    for symbol in symbols:
+    try:
+        # period="5d" is intentional.
+        # Yahoo/yfinance can sometimes be sparse or delayed with period="1d",
+        # especially around mixed exchanges or holidays.
         try:
             data = yf.download(
                 tickers=symbol,
-                period="1d",
+                period="5d",
+                interval="1m",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                prepost=False,
+                multi_level_index=False,
+            )
+        except TypeError:
+            # Fallback for older yfinance versions that do not support multi_level_index.
+            data = yf.download(
+                tickers=symbol,
+                period="5d",
                 interval="1m",
                 auto_adjust=False,
                 progress=False,
@@ -160,53 +243,99 @@ def download_intraday_data(symbols_tuple):
                 prepost=False,
             )
 
-            if data.empty:
-                messages.append(f"{symbol}: no intraday data available.")
-                continue
+        if data.empty:
+            messages.append(f"{symbol}: no intraday data returned.")
+            return None, None, messages
 
-            if data.index.tz is None:
-                data.index = data.index.tz_localize("UTC").tz_convert(EASTERN_TZ)
-            else:
-                data.index = data.index.tz_convert(EASTERN_TZ)
+        # Convert each symbol independently to Eastern Time.
+        if data.index.tz is None:
+            data.index = data.index.tz_localize("UTC").tz_convert(EASTERN_TZ)
+        else:
+            data.index = data.index.tz_convert(EASTERN_TZ)
 
-            data = filter_regular_market_hours(data)
+        data = data.sort_index()
+        data = data[~data.index.duplicated(keep="last")]
 
-            if data.empty:
-                messages.append(f"{symbol}: no regular-hours intraday data available yet.")
-                continue
+        # Keep regular market hours only.
+        data = filter_regular_market_hours(data)
 
-            if isinstance(data.columns, pd.MultiIndex):
-                try:
-                    close_series = data["Close"][symbol]
-                    volume_series = data["Volume"][symbol]
-                except Exception:
-                    messages.append(f"{symbol}: could not read Close/Volume data.")
-                    continue
-            else:
-                close_series = data["Close"]
-                if "Volume" in data.columns:
-                    volume_series = data["Volume"]
-                else:
-                    volume_series = pd.Series(0, index=data.index)
+        # Keep today's Eastern date only.
+        data = filter_today_eastern(data)
 
-            combined = pd.DataFrame(
-                {
-                    "Close": close_series,
-                    "Volume": volume_series,
-                }
-            ).dropna(subset=["Close"])
+        if data.empty:
+            messages.append(
+                f"{symbol}: no regular-hours intraday data available today "
+                f"({today_et}). Exchange may be closed, delayed, or ticker may be unavailable."
+            )
+            return None, None, messages
 
-            if combined.empty:
-                messages.append(f"{symbol}: no usable close data available.")
-                continue
+        close_series, volume_series = extract_close_and_volume(data, symbol)
 
-            closes[symbol] = combined["Close"]
-            volumes[symbol] = combined["Volume"].fillna(0)
+        if close_series is None:
+            messages.append(f"{symbol}: could not read Close data.")
+            return None, None, messages
 
-        except Exception as e:
-            messages.append(f"{symbol}: error downloading data: {e}")
+        close_series = pd.to_numeric(close_series, errors="coerce").dropna()
 
-    return closes, volumes, messages
+        if close_series.empty:
+            messages.append(f"{symbol}: no usable Close data today.")
+            return None, None, messages
+
+        if volume_series is None:
+            volume_series = pd.Series(0, index=close_series.index)
+        else:
+            volume_series = pd.to_numeric(volume_series, errors="coerce").fillna(0)
+
+        volume_series = volume_series.reindex(close_series.index).fillna(0)
+
+        return close_series, volume_series, messages
+
+    except Exception as e:
+        messages.append(f"{symbol}: error downloading data: {e}")
+        return None, None, messages
+
+
+def download_intraday_data(symbols_tuple):
+    """
+    Downloads all symbols independently, then combines them at the end.
+
+    This avoids the problem where the first ticker's timestamp index controls
+    the entire DataFrame.
+    """
+
+    close_series_by_symbol = {}
+    volume_series_by_symbol = {}
+    all_messages = []
+
+    for symbol in symbols_tuple:
+        symbol = normalize_ticker(symbol)
+
+        if not symbol:
+            continue
+
+        close_series, volume_series, messages = download_one_symbol_intraday_data(symbol)
+
+        all_messages.extend(messages)
+
+        if close_series is not None and not close_series.empty:
+            close_series_by_symbol[symbol] = close_series
+
+        if volume_series is not None and not volume_series.empty:
+            volume_series_by_symbol[symbol] = volume_series
+
+    if close_series_by_symbol:
+        closes = pd.concat(close_series_by_symbol, axis=1)
+        closes = closes.sort_index()
+    else:
+        closes = pd.DataFrame()
+
+    if volume_series_by_symbol:
+        volumes = pd.concat(volume_series_by_symbol, axis=1)
+        volumes = volumes.sort_index()
+    else:
+        volumes = pd.DataFrame()
+
+    return closes, volumes, all_messages
 
 
 def forward_fill_intraday_prices(closes):
@@ -845,7 +974,7 @@ auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
 manual_refresh = st.sidebar.button("Refresh now")
 
 st.sidebar.caption(
-    "The chart uses regular market hours only: 9:30 AM to 4:00 PM ET."
+    "The chart uses today's regular market hours only: 9:30 AM to 4:00 PM ET."
 )
 
 st.sidebar.caption(
@@ -870,12 +999,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v7 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v7" not in st.session_state:
-    st.session_state["portfolio_input_df_v7"] = create_default_input_df()
+# Use v9 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v9" not in st.session_state:
+    st.session_state["portfolio_input_df_v9"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v7"],
+    st.session_state["portfolio_input_df_v9"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -930,7 +1059,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v7",
+    key="portfolio_editor_v9",
 )
 
 input_df = clean_input_df(entry_df)
@@ -940,7 +1069,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v7"] = entry_df.copy()
+st.session_state["portfolio_input_df_v9"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -959,19 +1088,19 @@ symbols = tuple(input_df["Stock Symbol"].tolist())
 # MARKET DATA
 # ============================================================
 
-with st.spinner("Downloading intraday market data..."):
+with st.spinner("Downloading today's intraday market data, one symbol at a time..."):
     closes, volumes, messages = download_intraday_data(symbols)
 
 if messages:
-    with st.expander("Data messages", expanded=False):
+    with st.expander("Data messages", expanded=True):
         for message in messages:
             st.write(message)
 
 if closes.empty:
     st.warning(
-        "No regular-hours intraday data available for the selected tickers. "
-        "This can happen before 9:30 AM ET, after market close, on weekends, "
-        "or if Yahoo Finance has not published data yet."
+        "No regular-hours intraday data is available today for the selected tickers. "
+        "This can happen before 9:30 AM ET, after market close, on weekends/holidays, "
+        "or if Yahoo Finance has not published today's data yet."
     )
     st.stop()
 
@@ -980,7 +1109,7 @@ pct_change = calculate_percent_change(closes)
 if pct_change.empty:
     st.warning(
         "Could not calculate percent changes. "
-        "This usually means there is not enough valid intraday price data yet."
+        "This usually means there is not enough valid intraday price data today."
     )
     st.stop()
 
@@ -990,7 +1119,7 @@ dollar_values = calculate_dollar_values(
 )
 
 if dollar_values.empty:
-    st.warning("Could not calculate dollar values from the downloaded data.")
+    st.warning("Could not calculate dollar values from today's downloaded data.")
     st.stop()
 
 opening_values = calculate_opening_values(
@@ -1006,7 +1135,7 @@ initial_total_value = sum(
 if initial_total_value <= 0:
     st.warning(
         "Opening portfolio value could not be calculated. "
-        "This usually means no valid opening prices were available for the selected tickers."
+        "This usually means no valid opening prices were available today for the selected tickers."
     )
     st.stop()
 
@@ -1015,7 +1144,7 @@ portfolio_total_value = calculate_portfolio_total_value(dollar_values)
 if portfolio_total_value.empty or portfolio_total_value.dropna().empty:
     st.warning(
         "Portfolio total value could not be calculated. "
-        "No usable intraday price data was returned yet. "
+        "No usable intraday price data was returned today. "
         "This can happen before market open, on weekends/holidays, or when Yahoo Finance is delayed."
     )
     st.stop()
@@ -1028,7 +1157,7 @@ for symbol in input_df["Stock Symbol"]:
 
 if missing_symbols:
     st.warning(
-        "Some tickers did not return usable intraday data and may be excluded from the live portfolio total: "
+        "Some tickers did not return usable intraday data today and may be excluded from the live portfolio total: "
         + ", ".join(missing_symbols)
     )
 
@@ -1173,6 +1302,8 @@ st.plotly_chart(volume_fig, use_container_width=True)
 
 st.caption(
     "Dollar values are calculated as Initial Shares × Current Price. "
+    "Each ticker is downloaded independently. "
+    "Only today's Eastern Time trading data is used. "
     "Missing 1-minute quote gaps are forward-filled to avoid artificial portfolio dropouts. "
     "Percent change is measured from the first regular-market price at or after 9:30 AM ET."
 )
