@@ -14,13 +14,13 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 DEFAULT_PORTFOLIO = [
-    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 65.0},
+    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 10.0},
     {"Stock Symbol": "RKLB", "Initial Weighting %": 20.0, "Initial Shares": 20.0},
-    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 35.0},
-    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
-    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 30.0},
-    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 10.0},
-    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 5.0},
+    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 25.0},
+    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 2.0},
+    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 15.0},
+    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 15.0},
+    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
 ]
 
 EASTERN_TZ = ZoneInfo("America/New_York")
@@ -54,7 +54,7 @@ st.set_page_config(
 
 st.title("Weighted Stock Portfolio Tracker")
 st.caption(
-    "Tracks actual intraday portfolio value using number of shares, current prices, percent change, and approximate signed volume."
+    "Tracks actual intraday portfolio value using shares, current prices, percent change, and estimated volume pressure."
 )
 
 
@@ -184,7 +184,10 @@ def download_intraday_data(symbols_tuple):
                     continue
             else:
                 close_series = data["Close"]
-                volume_series = data["Volume"] if "Volume" in data.columns else pd.Series(0, index=data.index)
+                if "Volume" in data.columns:
+                    volume_series = data["Volume"]
+                else:
+                    volume_series = pd.Series(0, index=data.index)
 
             combined = pd.DataFrame(
                 {
@@ -210,8 +213,7 @@ def forward_fill_intraday_prices(closes):
     """
     Forward-fills missing 1-minute quote gaps.
 
-    This prevents the portfolio total from dropping sharply when one
-    ticker temporarily has no quote at a given minute.
+    This prevents portfolio value dropouts when one ticker temporarily has no quote.
     """
 
     if closes.empty:
@@ -255,8 +257,6 @@ def calculate_dollar_values(closes, input_df):
     Calculates actual dollar value over time:
 
         Stock Value = Number of Shares × Current Stock Price
-
-    Missing quote gaps are forward-filled to prevent artificial portfolio dropouts.
     """
 
     filled_closes = forward_fill_intraday_prices(closes)
@@ -275,7 +275,6 @@ def calculate_dollar_values(closes, input_df):
             continue
 
         shares = shares_by_symbol[symbol]
-
         dollar_values[symbol] = filled_closes[symbol] * shares
 
     return dollar_values
@@ -314,8 +313,9 @@ def calculate_portfolio_total_value(dollar_values):
     """
     Calculates total portfolio value.
 
-    Forward-fills component values so a missing 1-minute quote does not
-    temporarily remove a stock from the portfolio total.
+    Forward-fills component values and drops rows where not all active ticker
+    values are available yet. This avoids artificial dropouts and avoids
+    all-NaN portfolio totals.
     """
 
     if dollar_values.empty:
@@ -324,7 +324,13 @@ def calculate_portfolio_total_value(dollar_values):
     filled_values = dollar_values.copy().sort_index()
     filled_values = filled_values.ffill()
 
-    return filled_values.sum(axis=1, skipna=False)
+    # Remove early rows before all active tickers have at least one valid value
+    filled_values = filled_values.dropna(how="any")
+
+    if filled_values.empty:
+        return pd.Series(dtype=float)
+
+    return filled_values.sum(axis=1)
 
 
 def calculate_portfolio_percent_change(portfolio_total_value, initial_total_value):
@@ -336,14 +342,15 @@ def calculate_portfolio_percent_change(portfolio_total_value, initial_total_valu
 
 def calculate_signed_volume(closes, volumes):
     """
-    Approximates net purchase/sale volume using price direction:
+    Approximates net purchase/sale volume using price direction.
 
-    - If current minute close > prior minute close: positive volume / purchase pressure
-    - If current minute close < prior minute close: negative volume / sale pressure
-    - If unchanged: zero
+    Green / positive:
+        current minute close > prior minute close
 
-    This is not true bid/ask trade classification. It is a practical indicator
-    using available yfinance 1-minute OHLCV data.
+    Red / negative:
+        current minute close < prior minute close
+
+    This is not true bid/ask order-flow data.
     """
 
     if closes.empty or volumes.empty:
@@ -390,7 +397,6 @@ def calculate_signed_dollar_volume(closes, signed_volume):
             continue
 
         price_series = filled_closes[symbol].reindex(signed_volume.index).ffill()
-
         signed_dollar_volume[symbol] = signed_volume[symbol] * price_series
 
     return signed_dollar_volume
@@ -505,12 +511,9 @@ def get_market_open_close_for_chart(index):
 
 def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portfolio_pct_change):
     """
-    Creates one chart:
+    Main trend chart:
     - Left y-axis: total portfolio dollar value only
-    - Right y-axis: percent changes for each stock and the total portfolio
-    - Individual stock percent lines are dashed and colored
-    - Portfolio total value is solid black
-    - Portfolio percent change is dashed black
+    - Right y-axis: percent changes for each stock and total portfolio
     """
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -581,10 +584,10 @@ def make_dual_axis_chart(dollar_values, pct_change, portfolio_total_value, portf
     latest_portfolio_value = None
     latest_portfolio_pct = None
 
-    if not portfolio_total_value.empty:
+    if not portfolio_total_value.empty and not portfolio_total_value.dropna().empty:
         latest_portfolio_value = portfolio_total_value.dropna().iloc[-1]
 
-    if not portfolio_pct_change.empty:
+    if not portfolio_pct_change.empty and not portfolio_pct_change.dropna().empty:
         latest_portfolio_pct = portfolio_pct_change.dropna().iloc[-1]
 
     title_value = (
@@ -655,7 +658,7 @@ def make_volume_indicator_chart(signed_volume, portfolio_signed_dollar_volume):
     """
     Creates a row-based volume pressure chart:
     - One row for each stock symbol
-    - One final row for overall portfolio buy/sell pressure
+    - Final row for overall portfolio signed dollar volume
     - Green bars = estimated purchase pressure
     - Red bars = estimated sale pressure
     """
@@ -674,7 +677,6 @@ def make_volume_indicator_chart(signed_volume, portfolio_signed_dollar_volume):
         row_titles=row_titles,
     )
 
-    # Individual symbol signed volume rows
     for row_index, symbol in enumerate(symbols, start=1):
         series = signed_volume[symbol].fillna(0)
 
@@ -703,7 +705,6 @@ def make_volume_indicator_chart(signed_volume, portfolio_signed_dollar_volume):
             col=1,
         )
 
-    # Portfolio signed dollar volume row
     portfolio_row = len(row_titles)
 
     if not portfolio_signed_dollar_volume.empty:
@@ -768,7 +769,6 @@ def make_volume_indicator_chart(signed_volume, portfolio_signed_dollar_volume):
         showticklabels=True,
     )
 
-    # Label the portfolio row differently because it is signed dollar volume
     fig.update_yaxes(
         title_text="Signed $ volume",
         row=portfolio_row,
@@ -861,12 +861,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v5 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v5" not in st.session_state:
-    st.session_state["portfolio_input_df_v5"] = create_default_input_df()
+# Use v6 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v6" not in st.session_state:
+    st.session_state["portfolio_input_df_v6"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v5"],
+    st.session_state["portfolio_input_df_v6"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -921,7 +921,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v5",
+    key="portfolio_editor_v6",
 )
 
 input_df = clean_input_df(entry_df)
@@ -931,7 +931,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v5"] = entry_df.copy()
+st.session_state["portfolio_input_df_v6"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -968,6 +968,13 @@ if closes.empty:
 
 pct_change = calculate_percent_change(closes)
 
+if pct_change.empty:
+    st.warning(
+        "Could not calculate percent changes. "
+        "This usually means there is not enough valid intraday price data yet."
+    )
+    st.stop()
+
 dollar_values = calculate_dollar_values(
     closes=closes,
     input_df=input_df,
@@ -987,12 +994,34 @@ initial_total_value = sum(
     if value is not None and not pd.isna(value)
 )
 
+if initial_total_value <= 0:
+    st.warning(
+        "Opening portfolio value could not be calculated. "
+        "This usually means no valid opening prices were available for the selected tickers."
+    )
+    st.stop()
+
 portfolio_total_value = calculate_portfolio_total_value(dollar_values)
+
+if portfolio_total_value.empty or portfolio_total_value.dropna().empty:
+    st.warning(
+        "Portfolio total value could not be calculated. "
+        "This usually means one or more tickers did not return enough intraday data yet. "
+        "Try Refresh now, check ticker symbols, or wait until regular market data is available."
+    )
+    st.stop()
 
 portfolio_pct_change = calculate_portfolio_percent_change(
     portfolio_total_value=portfolio_total_value,
     initial_total_value=initial_total_value,
 )
+
+if portfolio_pct_change.empty or portfolio_pct_change.dropna().empty:
+    st.warning(
+        "Portfolio percent change could not be calculated. "
+        "This usually means the opening portfolio value or current value is unavailable."
+    )
+    st.stop()
 
 tracking_df = update_tracking_table(
     input_df=input_df,
@@ -1022,12 +1051,7 @@ portfolio_signed_dollar_volume = calculate_portfolio_signed_dollar_volume(
 # ============================================================
 
 latest_portfolio_value = portfolio_total_value.dropna().iloc[-1]
-
-if not portfolio_pct_change.empty:
-    latest_portfolio_pct = portfolio_pct_change.dropna().iloc[-1]
-else:
-    latest_portfolio_pct = 0.0
-
+latest_portfolio_pct = portfolio_pct_change.dropna().iloc[-1]
 latest_gain_loss = latest_portfolio_value - initial_total_value
 
 col1, col2, col3, col4, col5 = st.columns(5)
