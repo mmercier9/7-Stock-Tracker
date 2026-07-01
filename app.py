@@ -313,24 +313,33 @@ def calculate_portfolio_total_value(dollar_values):
     """
     Calculates total portfolio value.
 
-    Forward-fills component values and drops rows where not all active ticker
-    values are available yet. This avoids artificial dropouts and avoids
-    all-NaN portfolio totals.
+    This version is tolerant of missing data:
+    - forward-fills quote gaps
+    - drops symbols that never returned data
+    - sums available ticker values
+    - prevents all-NaN totals from becoming zero
     """
 
     if dollar_values.empty:
         return pd.Series(dtype=float)
 
     filled_values = dollar_values.copy().sort_index()
+
+    # Carry forward last known value for each stock.
     filled_values = filled_values.ffill()
 
-    # Remove early rows before all active tickers have at least one valid value
-    filled_values = filled_values.dropna(how="any")
+    # Remove symbols that never received usable data.
+    filled_values = filled_values.dropna(axis=1, how="all")
 
     if filled_values.empty:
         return pd.Series(dtype=float)
 
-    return filled_values.sum(axis=1)
+    # Sum available values. min_count=1 keeps all-NaN rows as NaN.
+    portfolio_total = filled_values.sum(axis=1, skipna=True, min_count=1)
+
+    portfolio_total = portfolio_total.dropna()
+
+    return portfolio_total
 
 
 def calculate_portfolio_percent_change(portfolio_total_value, initial_total_value):
@@ -861,12 +870,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v6 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v6" not in st.session_state:
-    st.session_state["portfolio_input_df_v6"] = create_default_input_df()
+# Use v7 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v7" not in st.session_state:
+    st.session_state["portfolio_input_df_v7"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v6"],
+    st.session_state["portfolio_input_df_v7"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -921,7 +930,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v6",
+    key="portfolio_editor_v7",
 )
 
 input_df = clean_input_df(entry_df)
@@ -931,7 +940,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v6"] = entry_df.copy()
+st.session_state["portfolio_input_df_v7"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -1006,10 +1015,22 @@ portfolio_total_value = calculate_portfolio_total_value(dollar_values)
 if portfolio_total_value.empty or portfolio_total_value.dropna().empty:
     st.warning(
         "Portfolio total value could not be calculated. "
-        "This usually means one or more tickers did not return enough intraday data yet. "
-        "Try Refresh now, check ticker symbols, or wait until regular market data is available."
+        "No usable intraday price data was returned yet. "
+        "This can happen before market open, on weekends/holidays, or when Yahoo Finance is delayed."
     )
     st.stop()
+
+missing_symbols = []
+
+for symbol in input_df["Stock Symbol"]:
+    if symbol not in dollar_values.columns or dollar_values[symbol].dropna().empty:
+        missing_symbols.append(symbol)
+
+if missing_symbols:
+    st.warning(
+        "Some tickers did not return usable intraday data and may be excluded from the live portfolio total: "
+        + ", ".join(missing_symbols)
+    )
 
 portfolio_pct_change = calculate_portfolio_percent_change(
     portfolio_total_value=portfolio_total_value,
