@@ -14,13 +14,13 @@ from streamlit_autorefresh import st_autorefresh
 # ============================================================
 
 DEFAULT_PORTFOLIO = [
-    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 10.0},
+    {"Stock Symbol": "MDA.TO", "Initial Weighting %": 25.0, "Initial Shares": 65.0},
     {"Stock Symbol": "RKLB", "Initial Weighting %": 20.0, "Initial Shares": 20.0},
-    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 25.0},
-    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 2.0},
-    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 15.0},
-    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 15.0},
-    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
+    {"Stock Symbol": "LUNR", "Initial Weighting %": 7.5, "Initial Shares": 35.0},
+    {"Stock Symbol": "NOC", "Initial Weighting %": 12.5, "Initial Shares": 3.0},
+    {"Stock Symbol": "IRDM", "Initial Weighting %": 15.0, "Initial Shares": 30.0},
+    {"Stock Symbol": "ASTS", "Initial Weighting %": 7.5, "Initial Shares": 10.0},
+    {"Stock Symbol": "LHX", "Initial Weighting %": 12.5, "Initial Shares": 5.0},
 ]
 
 EASTERN_TZ = ZoneInfo("America/New_York")
