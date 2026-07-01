@@ -138,15 +138,34 @@ def filter_today_eastern(data):
     """
     Keeps only today's Eastern Time date.
 
-    This prevents stale prior-session data from closed exchanges from being
-    mixed with today's active data.
+    This prevents stale prior-session intraday data from being mixed
+    with today's active ticker data.
     """
 
     if data.empty:
         return data
 
     today_et = datetime.now(EASTERN_TZ).date()
+
     return data[data.index.date == today_et]
+
+
+def get_today_market_open_timestamp():
+    """
+    Returns today's 9:30 AM Eastern timestamp.
+
+    Used to place fallback prices on today's chart when a ticker is inactive.
+    """
+
+    today_et = datetime.now(EASTERN_TZ).date()
+
+    return pd.Timestamp(
+        datetime.combine(
+            today_et,
+            MARKET_OPEN_TIME,
+            tzinfo=EASTERN_TZ
+        )
+    )
 
 
 def extract_close_and_volume(data, symbol):
@@ -161,7 +180,7 @@ def extract_close_and_volume(data, symbol):
     volume_series = None
 
     if isinstance(data.columns, pd.MultiIndex):
-        # Most common MultiIndex format: ("Close", "AAPL")
+        # Common MultiIndex format: ("Close", "AAPL")
         if ("Close", symbol) in data.columns:
             close_series = data[("Close", symbol)]
         elif (symbol, "Close") in data.columns:
@@ -204,17 +223,118 @@ def extract_close_and_volume(data, symbol):
     return close_series, volume_series
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def download_last_known_close(symbol):
+    """
+    Downloads the most recent daily close for a symbol.
+
+    This is used when today's intraday data is unavailable, for example:
+    - exchange holiday
+    - ticker not trading today
+    - Yahoo Finance delayed/missing intraday data
+    """
+
+    try:
+        try:
+            daily_data = yf.download(
+                tickers=symbol,
+                period="10d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                multi_level_index=False,
+            )
+        except TypeError:
+            daily_data = yf.download(
+                tickers=symbol,
+                period="10d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+        if daily_data.empty:
+            return None, None
+
+        close_series, _ = extract_close_and_volume(daily_data, symbol)
+
+        if close_series is None:
+            return None, None
+
+        close_series = pd.to_numeric(close_series, errors="coerce").dropna()
+
+        if close_series.empty:
+            return None, None
+
+        last_close = float(close_series.iloc[-1])
+        last_close_date = close_series.index[-1]
+
+        return last_close, last_close_date
+
+    except Exception:
+        return None, None
+
+
+def make_fallback_price_series(symbol, fallback_price):
+    """
+    Creates a one-point price series at today's market open.
+
+    The rest of the app forward-fills this value, so the inactive symbol
+    remains included as a flat/static holding value.
+    """
+
+    market_open_timestamp = get_today_market_open_timestamp()
+
+    close_series = pd.Series(
+        [fallback_price],
+        index=pd.DatetimeIndex([market_open_timestamp]),
+        name=symbol,
+    )
+
+    volume_series = pd.Series(
+        [0],
+        index=pd.DatetimeIndex([market_open_timestamp]),
+        name=symbol,
+    )
+
+    return close_series, volume_series
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def download_one_symbol_intraday_data(symbol):
     """
     Downloads one ticker independently.
 
-    This prevents one symbol's exchange calendar, timezone, or timestamp index
-    from controlling the data returned for another symbol.
+    If today's intraday data is unavailable, this function falls back to
+    the most recent daily close so inactive holdings remain included in
+    portfolio value.
     """
 
     messages = []
     today_et = datetime.now(EASTERN_TZ).date()
+
+    def use_last_known_close(reason):
+        last_close, last_close_date = download_last_known_close(symbol)
+
+        if last_close is None:
+            messages.append(
+                f"{symbol}: {reason} No last-known close was available."
+            )
+            return None, None, messages
+
+        close_series, volume_series = make_fallback_price_series(
+            symbol=symbol,
+            fallback_price=last_close,
+        )
+
+        messages.append(
+            f"{symbol}: {reason} Using last known close "
+            f"${last_close:,.2f} from {last_close_date}."
+        )
+
+        return close_series, volume_series, messages
 
     try:
         # period="5d" is intentional.
@@ -232,7 +352,6 @@ def download_one_symbol_intraday_data(symbol):
                 multi_level_index=False,
             )
         except TypeError:
-            # Fallback for older yfinance versions that do not support multi_level_index.
             data = yf.download(
                 tickers=symbol,
                 period="5d",
@@ -244,8 +363,9 @@ def download_one_symbol_intraday_data(symbol):
             )
 
         if data.empty:
-            messages.append(f"{symbol}: no intraday data returned.")
-            return None, None, messages
+            return use_last_known_close(
+                "No intraday data returned today."
+            )
 
         # Convert each symbol independently to Eastern Time.
         if data.index.tz is None:
@@ -263,23 +383,23 @@ def download_one_symbol_intraday_data(symbol):
         data = filter_today_eastern(data)
 
         if data.empty:
-            messages.append(
-                f"{symbol}: no regular-hours intraday data available today "
-                f"({today_et}). Exchange may be closed, delayed, or ticker may be unavailable."
+            return use_last_known_close(
+                f"No regular-hours intraday data available today ({today_et})."
             )
-            return None, None, messages
 
         close_series, volume_series = extract_close_and_volume(data, symbol)
 
         if close_series is None:
-            messages.append(f"{symbol}: could not read Close data.")
-            return None, None, messages
+            return use_last_known_close(
+                "Could not read intraday Close data."
+            )
 
         close_series = pd.to_numeric(close_series, errors="coerce").dropna()
 
         if close_series.empty:
-            messages.append(f"{symbol}: no usable Close data today.")
-            return None, None, messages
+            return use_last_known_close(
+                "No usable intraday Close data today."
+            )
 
         if volume_series is None:
             volume_series = pd.Series(0, index=close_series.index)
@@ -291,8 +411,9 @@ def download_one_symbol_intraday_data(symbol):
         return close_series, volume_series, messages
 
     except Exception as e:
-        messages.append(f"{symbol}: error downloading data: {e}")
-        return None, None, messages
+        return use_last_known_close(
+            f"Error downloading intraday data: {e}."
+        )
 
 
 def download_intraday_data(symbols_tuple):
@@ -358,7 +479,7 @@ def calculate_percent_change(closes):
     """
     Calculates percent change from the first valid regular-market intraday price.
 
-    Missing quote gaps are forward-filled to prevent artificial chart dropouts.
+    Missing quote gaps and inactive/fallback holdings are forward-filled.
     """
 
     filled_closes = forward_fill_intraday_prices(closes)
@@ -411,9 +532,10 @@ def calculate_dollar_values(closes, input_df):
 
 def calculate_opening_values(closes, input_df):
     """
-    Calculates opening value at the first regular-market price:
+    Calculates opening value at the first available value for the day.
 
-        Opening Value = Number of Shares × First Regular-Market Price
+    For active tickers, this is the first regular-market price.
+    For inactive/fallback tickers, this is the last known close placed at 9:30 AM ET.
     """
 
     filled_closes = forward_fill_intraday_prices(closes)
@@ -444,9 +566,9 @@ def calculate_portfolio_total_value(dollar_values):
 
     This version is tolerant of missing data:
     - forward-fills quote gaps
+    - includes fallback/static values for inactive holdings
     - drops symbols that never returned data
     - sums available ticker values
-    - prevents all-NaN totals from becoming zero
     """
 
     if dollar_values.empty:
@@ -488,6 +610,7 @@ def calculate_signed_volume(closes, volumes):
     Red / negative:
         current minute close < prior minute close
 
+    Fallback/inactive holdings have zero volume.
     This is not true bid/ask order-flow data.
     """
 
@@ -978,7 +1101,7 @@ st.sidebar.caption(
 )
 
 st.sidebar.caption(
-    "MDA may need to be entered as MDA.TO for Yahoo Finance."
+    "Inactive or closed-market symbols use their last known daily close."
 )
 
 if auto_refresh:
@@ -999,12 +1122,12 @@ if manual_refresh:
 
 st.subheader("Portfolio Data Entry and Current Tracking")
 
-# Use v9 session key so Streamlit does not reuse old table format from prior versions.
-if "portfolio_input_df_v9" not in st.session_state:
-    st.session_state["portfolio_input_df_v9"] = create_default_input_df()
+# Use v10 session key so Streamlit does not reuse old table format from prior versions.
+if "portfolio_input_df_v10" not in st.session_state:
+    st.session_state["portfolio_input_df_v10"] = create_default_input_df()
 
 entry_df = st.data_editor(
-    st.session_state["portfolio_input_df_v9"],
+    st.session_state["portfolio_input_df_v10"],
     num_rows="fixed",
     use_container_width=True,
     hide_index=True,
@@ -1059,7 +1182,7 @@ entry_df = st.data_editor(
         "Current % Change",
         "Dollar Gain/Loss Since Open",
     ],
-    key="portfolio_editor_v9",
+    key="portfolio_editor_v10",
 )
 
 input_df = clean_input_df(entry_df)
@@ -1069,7 +1192,7 @@ if not is_valid:
     st.error(validation_message)
     st.stop()
 
-st.session_state["portfolio_input_df_v9"] = entry_df.copy()
+st.session_state["portfolio_input_df_v10"] = entry_df.copy()
 
 total_initial_weight = input_df["Initial Weighting %"].sum()
 
@@ -1098,9 +1221,8 @@ if messages:
 
 if closes.empty:
     st.warning(
-        "No regular-hours intraday data is available today for the selected tickers. "
-        "This can happen before 9:30 AM ET, after market close, on weekends/holidays, "
-        "or if Yahoo Finance has not published today's data yet."
+        "No intraday or fallback daily-close data is available for the selected tickers. "
+        "Check ticker symbols or try again later."
     )
     st.stop()
 
@@ -1109,7 +1231,7 @@ pct_change = calculate_percent_change(closes)
 if pct_change.empty:
     st.warning(
         "Could not calculate percent changes. "
-        "This usually means there is not enough valid intraday price data today."
+        "This usually means there is not enough valid price data today."
     )
     st.stop()
 
@@ -1119,7 +1241,7 @@ dollar_values = calculate_dollar_values(
 )
 
 if dollar_values.empty:
-    st.warning("Could not calculate dollar values from today's downloaded data.")
+    st.warning("Could not calculate dollar values from downloaded data.")
     st.stop()
 
 opening_values = calculate_opening_values(
@@ -1135,7 +1257,7 @@ initial_total_value = sum(
 if initial_total_value <= 0:
     st.warning(
         "Opening portfolio value could not be calculated. "
-        "This usually means no valid opening prices were available today for the selected tickers."
+        "This usually means no valid prices were available for the selected tickers."
     )
     st.stop()
 
@@ -1144,8 +1266,7 @@ portfolio_total_value = calculate_portfolio_total_value(dollar_values)
 if portfolio_total_value.empty or portfolio_total_value.dropna().empty:
     st.warning(
         "Portfolio total value could not be calculated. "
-        "No usable intraday price data was returned today. "
-        "This can happen before market open, on weekends/holidays, or when Yahoo Finance is delayed."
+        "No usable price data was returned."
     )
     st.stop()
 
@@ -1157,7 +1278,7 @@ for symbol in input_df["Stock Symbol"]:
 
 if missing_symbols:
     st.warning(
-        "Some tickers did not return usable intraday data today and may be excluded from the live portfolio total: "
+        "Some tickers did not return usable intraday or fallback data and may be excluded from the live portfolio total: "
         + ", ".join(missing_symbols)
     )
 
@@ -1227,7 +1348,7 @@ with col3:
 
 with col4:
     st.metric(
-        "Active tickers",
+        "Active / included tickers",
         len(dollar_values.columns),
     )
 
@@ -1285,6 +1406,7 @@ st.subheader("Estimated Purchase / Sale Volume Pressure")
 st.caption(
     "This indicator approximates buy/sell pressure using minute-to-minute price direction. "
     "Green bars mean price rose during that minute, red bars mean price fell during that minute. "
+    "Inactive/fallback symbols have zero volume. "
     "This is not true bid/ask order-flow data."
 )
 
@@ -1303,9 +1425,8 @@ st.plotly_chart(volume_fig, use_container_width=True)
 st.caption(
     "Dollar values are calculated as Initial Shares × Current Price. "
     "Each ticker is downloaded independently. "
-    "Only today's Eastern Time trading data is used. "
-    "Missing 1-minute quote gaps are forward-filled to avoid artificial portfolio dropouts. "
-    "Percent change is measured from the first regular-market price at or after 9:30 AM ET."
+    "If today's intraday data is unavailable, the most recent daily close is used as a flat fallback value. "
+    "Missing 1-minute quote gaps are forward-filled to avoid artificial portfolio dropouts."
 )
 
 if auto_refresh:
